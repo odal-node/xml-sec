@@ -22,6 +22,154 @@ use xml_sec::xmldsig::{
 
 const VERIFICATION_TIME: u64 = 1_773_964_800; // 2026-03-20T00:00:00Z
 
+#[test]
+fn default_path_validation_preflights_every_evidence_source() {
+    // The convenience API must enforce the same admission as its explicit
+    // overload, including unused malformed evidence before path processing.
+    let limits = xml_sec::policy::ResourcePolicy::default();
+    for source in 0..3 {
+        let mut info = X509DataInfo::default();
+        let mut anchors = Vec::new();
+        let bytes = vec![0; limits.max_external_resource_bytes + 1];
+        match source {
+            0 => info.certificates.push(bytes),
+            1 => info.crls.push(bytes),
+            _ => anchors.push(bytes),
+        }
+        let result = verify_x509_certificate_chain(&info, &options(&anchors, false));
+        assert!(
+            matches!(result, Err(X509ChainError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                resource: "external resource bytes", maximum
+            }
+        )) if maximum == limits.max_external_resource_bytes),
+            "source {source}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn default_path_validation_counts_combined_evidence_bytes() {
+    // Each item fits, but all inputs must share the default aggregate ceiling.
+    let limits = xml_sec::policy::ResourcePolicy::default();
+    let mut info = X509DataInfo::default();
+    let count = limits.max_external_resource_total_bytes / limits.max_external_resource_bytes;
+    for _ in 0..count {
+        info.crls.push(vec![0; limits.max_external_resource_bytes]);
+    }
+    let anchors = [vec![0; 1]];
+    let result = verify_x509_certificate_chain(&info, &options(&anchors, false));
+    assert!(
+        matches!(result, Err(X509ChainError::Policy(
+        xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+            resource: "aggregate external resource bytes", maximum
+        }
+    )) if maximum == limits.max_external_resource_total_bytes),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn direct_path_validation_preflights_every_evidence_source() {
+    // Oversized borrowed DER must fail admission even if the path is empty or
+    // CRL checking is disabled; malformed DER must never hide that refusal.
+    for source in 0..3 {
+        let mut info = X509DataInfo::default();
+        let mut anchors = Vec::new();
+        match source {
+            0 => info.certificates.push(vec![0; 2]),
+            1 => info.crls.push(vec![0; 2]),
+            _ => anchors.push(vec![0; 2]),
+        }
+        let resources = xml_sec::policy::ResourcePolicy {
+            max_external_resource_bytes: 1,
+            ..Default::default()
+        };
+        let result = xml_sec::xmldsig::verify_x509_certificate_chain_with_resources(
+            &info,
+            &options(&anchors, false),
+            &resources,
+            xml_sec::provider::default_provider(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(X509ChainError::Policy(
+                    xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                        resource: "external resource bytes",
+                        maximum: 1
+                    }
+                ))
+            ),
+            "source {source}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn direct_path_validation_counts_combined_evidence_bytes() {
+    // Certificate, CRL and anchor inputs share one total, not three independent
+    // allowances. Exact admission still proceeds to the ordinary path error.
+    let mut info = X509DataInfo::default();
+    info.certificates.push(vec![0]);
+    info.crls.push(vec![0]);
+    let anchors = [vec![0]];
+    for maximum in [2, 3] {
+        let resources = xml_sec::policy::ResourcePolicy {
+            max_external_resource_bytes: 1,
+            max_external_resource_total_bytes: maximum,
+            ..Default::default()
+        };
+        let result = xml_sec::xmldsig::verify_x509_certificate_chain_with_resources(
+            &info,
+            &options(&anchors, false),
+            &resources,
+            xml_sec::provider::default_provider(),
+        );
+        if maximum == 2 {
+            assert!(
+                matches!(
+                    result,
+                    Err(X509ChainError::Policy(
+                        xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                            resource: "aggregate external resource bytes",
+                            maximum: 2
+                        }
+                    ))
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(result, Err(X509ChainError::UntrustedRoot));
+        }
+    }
+}
+
+#[test]
+fn direct_path_validation_uses_explicit_policy_limits() {
+    // The direct API must not restore default work/workspace allowances.
+    let info = parsed_chain("rsa/rsa-2048-cert.pem", None);
+    let anchors = [info.certificates.last().unwrap().clone()];
+    for memory in [false, true] {
+        let mut policy = xml_sec::policy::VerificationPolicy::default();
+        if memory {
+            policy.resources.max_x509_workspace_bytes = 1;
+        } else {
+            policy.resources.max_x509_work = 1;
+        }
+        let result = xml_sec::xmldsig::verify_x509_certificate_chain_with_resources(
+            &info,
+            &options(&anchors, false),
+            &policy.resources,
+            xml_sec::provider::default_provider(),
+        );
+        assert!(
+            matches!(result, Err(X509ChainError::Policy(_))),
+            "{result:?}"
+        );
+    }
+}
+
 fn pem_der(path: impl AsRef<Path>) -> Vec<u8> {
     let pem = fs::read_to_string(path).expect("fixture PEM should be readable");
     let mut inside_pem = false;
@@ -82,6 +230,12 @@ fn parsed_chain(leaf_path: &str, crl: Option<Vec<u8>>) -> X509DataInfo {
 
 fn options<'a>(trusted_certs: &'a [Vec<u8>], check_crls: bool) -> X509ChainOptions<'a> {
     X509ChainOptions {
+        // Explicit synthetic UTC coverage belongs to this test request, never
+        // to the library's defaults or a hidden network/clock lookup.
+        utc_facts: Some(
+            structured_pkix::temporal::LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
+                .expect("test UTC facts"),
+        ),
         trusted_certs,
         verification_time: UNIX_EPOCH + Duration::from_secs(VERIFICATION_TIME),
         max_chain_depth: 3,
@@ -627,10 +781,91 @@ fn rejects_malformed_crl_when_revocation_checking_is_enabled() {
     let info = parsed_chain("rsa/rsa-2048-cert.pem", Some(vec![1, 2, 3]));
     let anchors = [fixture("cacert.pem")];
 
-    assert!(matches!(
-        verify_x509_certificate_chain(&info, &options(&anchors, true)),
-        Err(X509ChainError::InvalidDer { kind: "CRL", .. })
-    ));
+    let result = verify_x509_certificate_chain(&info, &options(&anchors, true));
+    assert!(
+        matches!(
+            &result,
+            Err(X509ChainError::Processing(error)) if error.code()
+                == structured_pkix::ErrorCode::Encoding(structured_asn1::ErrorCode::UnexpectedEnd)
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn crl_time_qualification_requires_explicit_covered_utc_facts() {
+    // The public adapter must not silently invent UTC facts, round past an
+    // expiry boundary, or treat a future-dated entry as already revoked.
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "UTC evidence issuer");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root = rcgen::CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from(42_u64),
+            revocation_time: date_time_ymd(2026, 3, 16),
+            reason_code: None,
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&root)
+    .unwrap();
+    let mut info = generated_info(vec![leaf.der().to_vec(), root.der().to_vec()]);
+    info.crls.push(crl.der().to_vec());
+    let anchors = [root.der().to_vec()];
+    let mut inputs = options(&anchors, true);
+    inputs.utc_facts = None;
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &inputs),
+        Err(X509ChainError::MissingUtcFacts)
+    );
+    inputs.utc_facts = Some(
+        structured_pkix::temporal::LeapTable::new(
+            VERIFICATION_TIME as i64 - 1,
+            VERIFICATION_TIME as i64 + 1,
+            &[],
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &inputs),
+        Err(X509ChainError::CrlTimeUncertain {
+            index: 0,
+            reason: structured_pkix::temporal::Uncertainty::OutsideCoverage,
+        })
+    );
+    inputs.utc_facts = options(&anchors, true).utc_facts;
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &inputs),
+        Err(X509ChainError::Revoked(0))
+    );
+    inputs.verification_time =
+        UNIX_EPOCH + Duration::from_secs(date_time_ymd(2026, 3, 15).unix_timestamp() as u64);
+    assert_eq!(verify_x509_certificate_chain(&info, &inputs), Ok(()));
+    inputs.verification_time =
+        UNIX_EPOCH + Duration::from_secs(date_time_ymd(2026, 4, 15).unix_timestamp() as u64);
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &inputs),
+        Err(X509ChainError::Revoked(0))
+    );
+    inputs.verification_time += Duration::from_nanos(1);
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &inputs),
+        Err(X509ChainError::InvalidCrl(0))
+    );
 }
 
 #[test]
@@ -753,7 +988,7 @@ fn crl_issuer_v3_requires_key_usage_and_crl_sign() {
 }
 
 #[test]
-fn rejects_crl_with_unprocessed_critical_scope() {
+fn ignores_authenticated_crl_outside_the_targets_distribution_scope() {
     let mut root_params = CertificateParams::new(Vec::new()).unwrap();
     root_params
         .distinguished_name
@@ -787,7 +1022,137 @@ fn rejects_crl_with_unprocessed_critical_scope() {
 
     assert_eq!(
         verify_x509_certificate_chain(&info, &options(&anchors, true)),
-        Err(X509ChainError::InvalidCrl(0))
+        Ok(())
+    );
+}
+
+#[test]
+fn explicit_crl_distribution_names_keep_encoded_identity() {
+    // RFC 5280 §5.2.5 requires identical encoding for explicit DP/IDP names;
+    // general URI host normalization must not make a different encoding applicable.
+    // https://www.rfc-editor.org/rfc/rfc5280#section-5.2.5
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+    leaf_params.crl_distribution_points = vec![CrlDistributionPoint {
+        uris: vec!["https://example.test/root.crl".into()],
+    }];
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let anchors = [root.der().to_vec()];
+    for (uri, expected) in [
+        (
+            "https://example.test/root.crl",
+            Err(X509ChainError::Revoked(0)),
+        ),
+        ("https://EXAMPLE.test/root.crl", Ok(())),
+    ] {
+        let crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 3, 15),
+            next_update: date_time_ymd(2026, 4, 15),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: Some(CrlIssuingDistributionPoint {
+                distribution_point: CrlDistributionPoint {
+                    uris: vec![uri.into()],
+                },
+                scope: Some(CrlScope::UserCertsOnly),
+            }),
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(42_u64),
+                revocation_time: date_time_ymd(2026, 3, 16),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&root)
+        .unwrap();
+        let mut info = generated_info(vec![leaf.der().to_vec(), root.der().to_vec()]);
+        info.crls.push(crl.der().to_vec());
+        assert_eq!(
+            verify_x509_certificate_chain(&info, &options(&anchors, true)),
+            expected,
+            "{uri}"
+        );
+    }
+}
+
+#[test]
+fn partial_crl_absence_requires_complete_authenticated_reason_coverage() {
+    // RFC 5280 §6.3.3(d),(l): absence is qualified only for covered reasons;
+    // complementary authenticated complete lists may establish all reasons.
+    use x509_cert::ext::pkix::crl::dp::{IssuingDistributionPoint, Reasons};
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root = rcgen::CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+    let leaf = CertificateParams::new(Vec::new())
+        .unwrap()
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: Vec::new(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&root)
+    .unwrap();
+    let base: x509_cert::crl::CertificateList =
+        x509_cert::crl::CertificateList::from_der(crl.der()).unwrap();
+    let scoped =
+        |reason: Reasons| {
+            let mut encoded = base.clone();
+            let point = IssuingDistributionPoint {
+                distribution_point: None,
+                only_contains_user_certs: false,
+                only_contains_ca_certs: false,
+                only_some_reasons: Some(reason.into()),
+                indirect_crl: false,
+                only_contains_attribute_certs: false,
+            };
+            encoded.tbs_cert_list.crl_extensions.as_mut().unwrap().push(
+                x509_cert::ext::Extension {
+                    extn_id: der::asn1::ObjectIdentifier::new_unwrap("2.5.29.28"),
+                    critical: true,
+                    extn_value: der::asn1::OctetString::new(point.to_der().unwrap()).unwrap(),
+                },
+            );
+            let signature = root
+                .key()
+                .sign(&encoded.tbs_cert_list.to_der().unwrap())
+                .unwrap();
+            encoded.signature = BitString::from_bytes(&signature).unwrap();
+            encoded.to_der().unwrap()
+        };
+    let anchors = [root.der().to_vec()];
+    let mut info = generated_info(vec![leaf.der().to_vec(), root.der().to_vec()]);
+    info.crls.push(scoped(Reasons::KeyCompromise));
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, true)),
+        Err(X509ChainError::IncompleteCrlCoverage(0))
+    );
+    for reason in [
+        Reasons::CaCompromise,
+        Reasons::AffiliationChanged,
+        Reasons::Superseded,
+        Reasons::CessationOfOperation,
+        Reasons::CertificateHold,
+        Reasons::PrivilegeWithdrawn,
+        Reasons::AaCompromise,
+    ] {
+        info.crls.push(scoped(reason));
+    }
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, true)),
+        Ok(())
     );
 }
 
