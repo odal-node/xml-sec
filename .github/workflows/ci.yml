@@ -81,6 +81,8 @@ jobs:
         run: cargo clippy --no-default-features --features pkcs11,c14n,xml-backend-${{ matrix.backend }} --all-targets -- -D warnings
       - name: Check provider and policy contracts
         run: cargo nextest run --lib --no-default-features --features pkcs11,c14n,xml-backend-${{ matrix.backend }}
+      - name: Check configuration with only the token provider enabled
+        run: cargo nextest run -p xml-sec-config --no-default-features --features pkcs11,xml-backend-${{ matrix.backend }}
       - name: Exercise token operations with disposable storage
         run: bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --no-default-features --features c14n,xml-backend-${{ matrix.backend }}
 
@@ -140,7 +142,7 @@ jobs:
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
           - rust: stable
             xml-backend: xmlenc-inventory
-            cargo-args: --no-default-features --features xmlenc,xml-backend-xmloxide
+            cargo-args: --package xml-sec --no-default-features --features xmlenc,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: xmloxide
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
@@ -155,7 +157,11 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace ${{ matrix.cargo-args }}
+      - name: Build without enriching the inventory feature graph
+        run: >-
+          cargo build
+          ${{ matrix.xml-backend != 'xmlenc-inventory' && '--workspace' || '' }}
+          ${{ matrix.cargo-args }}
 
   build:
     runs-on: ubuntu-latest
