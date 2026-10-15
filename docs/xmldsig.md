@@ -601,6 +601,68 @@ parameters. An `id-RSASSA-PSS` issuer key with absent parameters imposes no para
 as required by RFC 4055 section 3.3; present key parameters constrain the signature hash, MGF,
 minimum salt length, and trailer field. Implicit external resource loading is not supported.
 
+## Scoped Authenticated Reference Replay
+
+`with_verified_request` verifies an existing `XmlDocument` once and lends a
+`VerifiedSession` to a continuation. The session retains the original document
+generation, selected provider, immutable policy, captured external resource map,
+authentication state and remaining operation budgets. Additional scoped storage,
+scalar inspection and terminal C14N scratch use the supplied current shared `Work`.
+This does not introduce alloc-only XMLDSig support.
+
+Select the exact successful Signature with `select_signature`. Its
+`visit_authenticated_references` visitor supplies original Reference identity,
+SignedInfo or Manifest parent, original URI/Type, resource provenance and any
+historical result. `Complete`, `Unchecked` and `Incomplete` describe discovery,
+not payload digest validity or signer trust. Authenticated Manifests can be nested
+or outside Signature. Unsigned instructions are excluded, and visitor refusal
+stops immediately with its original typed cause.
+
+`resolve_reference` reads an authenticated original property's expanded attribute
+or simple content through the same URI/ID registrations and XML Base kernel.
+Absent, malformed, unsupported, detached, unresolved, wrong-target and
+unauthenticated dispositions are separate from terminal processing/resource errors.
+
+`replay_reference` streams transform output to a fallible receiver without
+rechecking the historical digest algorithm. The original policy's transform
+count/permissions still apply before execution; Manifest instructions require
+`ManifestProcessing::Process`, otherwise processing returns
+`PolicyViolation::ManifestProcessingDisabled`. An authenticated unchecked
+catalogue entry does not grant permission to execute it.
+`ReferenceOutput` uses XMLDSig's
+implicit C14N 1.0 for a final node set. `Timestamp(original_method)` instead uses
+that original CanonicalizationMethod and PrefixList. An explicit final C14N
+transform or other final octets always takes precedence: octets are not parsed
+or canonicalized merely because timestamp mode was selected. Missing admitted
+external bytes return `Unavailable`, not successful empty output. Empty supplied
+bytes are valid input. No network/filesystem acquisition is implicit.
+
+Enveloped transforms use their actual containing Signature, not necessarily the
+Signature selected by the continuation. With no containing Signature in the source,
+the mandated XPath selects no nodes, as specified by
+[XMLDSig 1.1 section 6.6.4](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature).
+This source fact stays distinct from a Signature disappearing only from an
+intermediate transform result.
+Historical Manifest digest verification uses this same original Reference
+context. Enveloped cannot run on an unrelated external or base64-decoded XML
+document; only tracked canonicalization preserves identity across serialization.
+
+Raw final octets consume receiver work, not canonicalization output allowance.
+Actual C14N output consumes the remaining aggregate canonicalization budget;
+output and XML Base limits retain typed policy violations, and a partial output
+limit failure exhausts the spent allowance before a later replay.
+
+Receiver refusal remains `ReplayError::Receiver(E)`; XML/policy/resource refusal
+is `Processing`. Both stop output immediately. Repeated replay spends remaining
+budgets rather than resetting them; reentrant replay is refused. The continuation
+may return independently owned evidence or copied identities, never a borrowed
+document/operation capability. Consumers remain responsible for their format
+requirements and acceptance decisions.
+
+`xmldsig::extension::boolean_attribute` reads an exact expanded attribute without
+allocation and preserves absence separately from explicit false/malformed values.
+It does not authenticate the owner or supply application-profile defaults.
+
 ## RSA-PSS Parameters
 
 The nine fixed RSA-PSS methods use MGF1 with the signature digest and a salt of that digest's
