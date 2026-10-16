@@ -21,7 +21,11 @@ pub use key_establishment::{
     EcdhCurve, RustCryptoDhKey, RustCryptoEcdhKey, RustCryptoX448Key, RustCryptoX25519Key,
 };
 #[cfg(feature = "xmldsig")]
+mod key_association;
+#[cfg(feature = "xmldsig")]
 mod key_encapsulation;
+#[cfg(feature = "xmldsig")]
+pub use key_association::{KeyAssociation, KeyVerificationEvent, SignatureVerificationInput};
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 mod rsa_pkcs1v15;
 #[cfg(feature = "xmldsig")]
@@ -1046,6 +1050,38 @@ pub trait CryptoProvider: Send + Sync {
         self.verify(key, algorithm, data, signature)
     }
 
+    /// Verify once while reporting the actual successful leaf. Providers that
+    /// cannot identify it retain ordinary verification and report no receipt.
+    #[cfg(feature = "xmldsig")]
+    fn verify_with_key_receipt(
+        &self,
+        key: &dyn crate::xmldsig::VerifyingKey,
+        input: SignatureVerificationInput<'_>,
+        _observer: &mut dyn FnMut(
+            KeyVerificationEvent<'_>,
+        ) -> Result<(), crate::xmldsig::DsigError>,
+    ) -> Result<bool, crate::xmldsig::DsigError> {
+        self.verify_with_context(
+            key,
+            input.algorithm,
+            input.context,
+            input.data,
+            input.signature,
+        )
+    }
+
+    /// Compare the successful public receipt with original effective PKIX key
+    /// state. Unknown semantics are Unproven, never a second provider fallback.
+    #[cfg(feature = "xmldsig")]
+    fn associate_verification_key(
+        &self,
+        _actual: &[u8],
+        _expected: structured_pkix::path::WorkingKey<'_>,
+        _charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
+    ) -> Result<KeyAssociation, crate::xmldsig::DsigError> {
+        Ok(KeyAssociation::Unproven)
+    }
+
     /// Verify an X.509 certificate or CRL signature under its issuer SPKI.
     #[cfg(feature = "xmldsig")]
     fn verify_x509_signature(
@@ -1470,7 +1506,51 @@ impl TryRng for ProviderRng<'_> {
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 impl TryCryptoRng for ProviderRng<'_> {}
 
+#[cfg(feature = "xmldsig")]
+impl RustCryptoProvider {
+    fn verify_context_leaf(
+        key: &dyn crate::xmldsig::VerifyingKey,
+        algorithm: crate::xmldsig::SignatureAlgorithm,
+        context: &crate::xmldsig::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, crate::xmldsig::DsigError> {
+        if key.provider_binding().is_some() {
+            return Err(ProviderError::External(ExternalProviderError::Binding).into());
+        }
+        key.verify_with_context(algorithm, context, data, signature)
+    }
+}
+
 impl CryptoProvider for RustCryptoProvider {
+    #[cfg(feature = "xmldsig")]
+    fn verify_with_key_receipt(
+        &self,
+        key: &dyn crate::xmldsig::VerifyingKey,
+        input: SignatureVerificationInput<'_>,
+        observer: &mut dyn FnMut(KeyVerificationEvent<'_>) -> Result<(), crate::xmldsig::DsigError>,
+    ) -> Result<bool, crate::xmldsig::DsigError> {
+        self.require_capability(ProviderCapability::Verify(input.algorithm))?;
+        key_association::observed_leaf(key, observer, &|key| {
+            Self::verify_context_leaf(
+                key,
+                input.algorithm,
+                input.context,
+                input.data,
+                input.signature,
+            )
+        })
+    }
+
+    #[cfg(feature = "xmldsig")]
+    fn associate_verification_key(
+        &self,
+        actual: &[u8],
+        expected: structured_pkix::path::WorkingKey<'_>,
+        charge: &dyn Fn(u64) -> Result<(), structured_asn1::memory::MemoryError>,
+    ) -> Result<KeyAssociation, crate::xmldsig::DsigError> {
+        key_association::compare_rustcrypto(actual, expected, charge)
+    }
     #[cfg(feature = "xmldsig")]
     fn encapsulate_key(
         &self,
@@ -1748,10 +1828,9 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require_capability(ProviderCapability::Verify(algorithm))?;
-        if key.provider_binding().is_some() {
-            return Err(ProviderError::External(ExternalProviderError::Binding).into());
-        }
-        key.verify_with_context(algorithm, context, data, signature)
+        key_association::observed_leaf(key, &mut |_| Ok(()), &|key| {
+            Self::verify_context_leaf(key, algorithm, context, data, signature)
+        })
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1763,10 +1842,12 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require_capability(ProviderCapability::Verify(algorithm))?;
-        if key.provider_binding().is_some() {
-            return Err(ProviderError::External(ExternalProviderError::Binding).into());
-        }
-        key.verify(algorithm, data, signature)
+        key_association::observed_leaf(key, &mut |_| Ok(()), &|key| {
+            if key.provider_binding().is_some() {
+                return Err(ProviderError::External(ExternalProviderError::Binding).into());
+            }
+            key.verify(algorithm, data, signature)
+        })
     }
 
     #[cfg(feature = "xmldsig")]
