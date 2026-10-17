@@ -610,7 +610,29 @@ authentication state and remaining operation budgets. Additional scoped storage,
 scalar inspection and terminal C14N scratch use the supplied current shared `Work`.
 This does not introduce alloc-only XMLDSig support.
 
-Select the exact successful Signature with `select_signature`. Its
+Select the exact successful Signature with `select_signature` when continuing
+under the producer's original Work. For an independently funded continuation, use
+`session.with_query(signature, &current_work, |selected| { ... })`. Selection,
+catalogue/hash/key inspection, property resolution and replay then use that
+current execution's local ceiling and aggregate account. Retained session
+allocations keep their original charge; a new query does not reset the original
+compiled policy allowances or change the provider/document identity. Borrowed
+query capabilities cannot escape the callback; independently owned output may.
+Owned URI, replayed Reference layout, transform-policy and timestamp-method
+diagnostics also retain their current-query capacity charge until the error is
+dropped; a rejected transform URI is reported as
+`DsigError::AccountedPolicyAlgorithm`. If that storage cannot be admitted, the
+result is the original typed resource failure rather than an unaccounted copy
+of the URI, missing ID, algorithm or element name. Replay charges every
+Reference and timestamp-method text node by its byte length before checking it
+for mixed content.
+All implemented transform branches,
+parser/DOM construction, XPath workspaces, binary/XML transitions and terminal
+C14N admit their work and actual capacity before allocation or receiver effects.
+Existing unsupported capabilities remain unsupported; no new XSLT adapter is
+implied by independently funding a query.
+
+The selected handle's
 `visit_authenticated_references` visitor supplies original Reference identity,
 SignedInfo or Manifest parent, original URI/Type, resource provenance and any
 historical result. `Complete`, `Unchecked` and `Incomplete` describe discovery,
@@ -771,10 +793,12 @@ secrets and private/token key attributes are never copied into receipts.
 including its effective parameters. It rejects another operation, Signature,
 document generation or provider before comparison/callbacks. Results are `Same`,
 `Mismatch`, or `Unproven`; none establishes certificate authorization or trust.
-These two selected-handle methods use their session's original Work. Do not call
-`select_signature` first when funding a later query through a new execution: use
-the single-entry session query above instead. Reference catalogue, resolution
-and replay APIs remain session-funded; this key query does not change them.
+These two selected-handle methods use the selected handle's Work: the original
+execution after `select_signature`, or the current one inside `with_query`.
+For key-only association, prefer the single-entry session query above: it avoids
+building the Reference index required by a complete selected-signature query.
+Reference catalogue, resolution and replay can also use independently supplied
+Work through `with_query` as described above.
 No resolver, signature verification, fingerprint comparison, or SPKI re-encoding
 is performed to manufacture the association.
 

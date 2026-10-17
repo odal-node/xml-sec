@@ -17,6 +17,482 @@ fn account() -> Memory {
 }
 
 #[test]
+fn current_query_continues_after_producer_work_is_exhausted() {
+    // A completed producer's local ceiling must not fund later selection,
+    // catalogue/hash inspection or replay; retained storage stays accounted.
+    use structured_asn1::{Encoding, Limits, Parser, memory::Work as _};
+    let memory = account();
+    let producer = Parser::new(
+        Encoding::Der,
+        Limits {
+            max_work: 1 << 20,
+            ..Default::default()
+        },
+        memory.clone(),
+    );
+    let producer_reader = producer.read(&[], 0).unwrap();
+    let producer_work = producer_reader.execution();
+    let query = Parser::new(Encoding::Der, Limits::default(), memory.clone());
+    let query_reader = query.read(&[], 0).unwrap();
+    let query_work = query_reader.execution();
+    let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let document = XmlDocument::parse(xml).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document, &context, &VerificationRequest::default(), &producer_work,
+        |session| {
+            let signature = session.evidence().signatures()[0].identity();
+            for shift in (0..=20).rev() {
+                while producer_work.charge_work(1 << shift).is_ok() {}
+            }
+            assert!(session.select_signature(signature).is_err());
+            let retained = memory.used();
+            session.with_query(signature, &query_work, |selected| {
+                selected.signature_method().unwrap();
+                let mut references = 0;
+                selected.visit_authenticated_references(|_| {
+                    references += 1;
+                    Ok::<_, ()>(())
+                }).unwrap();
+                assert_eq!(references, 2);
+                selected.visit_hash_uses(|_| Ok::<_, ()>(())).unwrap();
+                let mut output = Vec::new();
+                assert_eq!(selected.replay_reference(
+                    session.view().node_for_id("inside", &[]).unwrap(),
+                    ReplayMode::ReferenceOutput,
+                    &mut |bytes: &[u8]| {
+                        output.extend_from_slice(bytes);
+                        Ok::<_, ()>(())
+                    },
+                ).unwrap(), ReplayOutcome::Complete);
+                assert_eq!(output, b"<target xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:u=\"urn:unused\" Id=\"target\">payload</target>");
+                Ok::<_, ()>(())
+            }).unwrap();
+            assert!(producer_work.charge_work(1).is_err());
+            assert_eq!(memory.used(), retained);
+            Ok(())
+        },
+    ).unwrap();
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn current_query_admits_binary_xml_parser_storage_before_receiver() {
+    // A small XPath projection does not bound its backing parsed document:
+    // one large text value must also fit the current query's capacity ceiling.
+    assert_binary_xml_storage_refused(format!("<root>{}</root>", "x".repeat(65536)).into_bytes());
+}
+
+#[test]
+fn current_query_admits_transcoding_storage_before_receiver() {
+    // A large UTF-16 result cannot hide its normalization allocation behind a
+    // small XPath projection. Every backend receives the same strict decoder.
+    let xml = format!(
+        "<?xml version='1.0' encoding='UTF-16'?><root>{}</root>",
+        "x".repeat(65536)
+    );
+    let mut bytes = vec![0xff, 0xfe];
+    bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    assert_binary_xml_storage_refused(bytes);
+}
+
+fn assert_binary_xml_storage_refused(bytes: Vec<u8>) {
+    let uri = "https://example.test/parser-storage";
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>"#;
+    let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
+    let resources = HashMap::from([(uri.to_owned(), bytes)]);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    for backend in backends() {
+        let document = XmlDocument::parse_with_backend(xml.clone(), backend).unwrap();
+        let context = VerifyContext::new()
+            .xml_backend(backend)
+            .key(&key)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .process_manifests(true);
+        with_verified_request(&document, &context, &request, &account(), |session| {
+            let current = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24)));
+            let mut calls = 0;
+            session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        let result = selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| {
+                                calls += 1;
+                                Ok::<_, ()>(())
+                            },
+                        );
+                        assert!(
+                            matches!(
+                                result,
+                                Err(ReplayError::Processing(DsigError::SharedExecution(
+                                    structured_asn1::memory::MemoryError::LimitExceeded
+                                )))
+                            ),
+                            "parser scratch must refuse, got {result:?}; receiver calls: {calls}"
+                        );
+                        Ok::<_, ()>(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(calls, 0);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn current_query_admits_original_node_projection_before_receiver() {
+    // A retained document is caller-owned, but each replay projection is not:
+    // its map capacity must be refused before the receiver sees any bytes.
+    let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let document =
+        XmlDocument::parse(xml.replace("payload", &"<child a='v'/>".repeat(1024))).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let current = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24)));
+            let mut called = false;
+            session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        let result = selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| {
+                                called = true;
+                                Ok::<_, ()>(())
+                            },
+                        );
+                        assert!(matches!(result, Err(ReplayError::Processing(_))));
+                        Ok::<_, ()>(())
+                    },
+                )
+                .unwrap();
+            assert!(!called);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn current_query_admits_nonterminal_c14n_before_receiver() {
+    // Nonterminal serialization must not allocate an unaccounted Vec before
+    // reparsing it for the next transform, even when terminal C14N is streamed.
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>"#;
+    let (xml, key) = signed_manifest(
+        "#target",
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        transforms,
+    );
+    let document = XmlDocument::parse(xml.replace("payload", &"x".repeat(65536))).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let current = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24)));
+            let mut calls = 0;
+            session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        let result = selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| {
+                                calls += 1;
+                                Ok::<_, ()>(())
+                            },
+                        );
+                        assert!(matches!(result, Err(ReplayError::Processing(_))));
+                        Ok::<_, ()>(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(calls, 0);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn current_query_admits_base64_capacity_before_receiver() {
+    // A large decoded output cannot hide in an ordinary Vec while only the
+    // small query index and replay records are charged to the supplied Work.
+    use base64::Engine as _;
+    let uri = "https://example.test/base64";
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms>"#;
+    let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
+    let document = XmlDocument::parse(xml).unwrap();
+    let resources = HashMap::from([(
+        uri.to_owned(),
+        base64::engine::general_purpose::STANDARD
+            .encode(vec![0x42; 65536])
+            .into_bytes(),
+    )]);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    let context = VerifyContext::new()
+        .key(&key)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .process_manifests(true);
+    with_verified_request(&document, &context, &request, &account(), |session| {
+        let current = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24)));
+        let mut calls = 0;
+        session
+            .with_query(
+                session.evidence().signatures()[0].identity(),
+                &current,
+                |selected| {
+                    let result = selected.replay_reference(
+                        session.view().node_for_id("inside", &[]).unwrap(),
+                        ReplayMode::ReferenceOutput,
+                        &mut |_: &[u8]| {
+                            calls += 1;
+                            Ok::<_, ()>(())
+                        },
+                    );
+                    assert!(matches!(result, Err(ReplayError::Processing(_))));
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(current.used(), 0);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn current_query_binary_chain_releases_consumed_input_capacity() {
+    // Each new binary owns its paid allocation. Previous decoded inputs must
+    // be released before downstream receiver work, not pinned by recursion.
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let uri = "https://example.test/base64-chain";
+    let transform = r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>"#;
+    let transforms = format!("<ds:Transforms>{transform}{transform}</ds:Transforms>");
+    let expected = vec![0x42; 65536];
+    let resources = HashMap::from([(
+        uri.to_owned(),
+        STANDARD.encode(STANDARD.encode(&expected)).into_bytes(),
+    )]);
+    let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", &transforms);
+    let document = XmlDocument::parse(xml).unwrap();
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    let context = VerifyContext::new()
+        .key(&key)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .process_manifests(true);
+    with_verified_request(&document, &context, &request, &account(), |session| {
+        let current = account();
+        session
+            .with_query(
+                session.evidence().signatures()[0].identity(),
+                &current,
+                |selected| {
+                    let result = selected
+                        .replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |bytes: &[u8]| {
+                                assert_eq!(bytes, expected);
+                                assert!(
+                                    current.used() >= bytes.len(),
+                                    "output capacity remains charged"
+                                );
+                                assert!(
+                                    current.used() < bytes.len() * 2,
+                                    "consumed input was released"
+                                );
+                                Ok::<_, ()>(())
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(result, ReplayOutcome::Complete);
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(current.used(), 0);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn current_query_admits_external_uri_scratch_before_lookup_output() {
+    // Resolving and normalizing a long external URI is current scratch, even
+    // when the caller already owns the document and the one-byte payload.
+    let uri = format!("https://example.test/{}", "x".repeat(16384));
+    let (xml, key) = signed_manifest(&uri, "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let document = XmlDocument::parse(xml).unwrap();
+    let resources = HashMap::from([(uri, vec![0x42])]);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    let context = VerifyContext::new()
+        .key(&key)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .process_manifests(true);
+    with_verified_request(&document, &context, &request, &account(), |session| {
+        let current = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24)));
+        let mut calls = 0;
+        session
+            .with_query(
+                session.evidence().signatures()[0].identity(),
+                &current,
+                |selected| {
+                    let result = selected.replay_reference(
+                        session.view().node_for_id("inside", &[]).unwrap(),
+                        ReplayMode::ReferenceOutput,
+                        &mut |_: &[u8]| {
+                            calls += 1;
+                            Ok::<_, ()>(())
+                        },
+                    );
+                    assert!(matches!(result, Err(ReplayError::Processing(_))));
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(current.used(), 0);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn current_query_base64_charges_local_and_aggregate_once() {
+    // Memory and a narrower Execution must pay the same aggregate cost.
+    // Exact local work succeeds; one less refuses before receiver effects.
+    // One original Reference makes the table's comparison count deterministic:
+    // independently seeded tables with two keys can require different probes.
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use structured_asn1::{Encoding, Limits, Parser};
+    let uri = "https://example.test/base64-work";
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms>"#;
+    let expected = vec![0x42; 768];
+    let encoded = STANDARD.encode(&expected).into_bytes();
+    let input_length = encoded.len();
+    let resources = HashMap::from([(uri.to_owned(), encoded)]);
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let template = format!(
+        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+<ds:SignedInfo>
+<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>
+<ds:Reference Id="inside" URI="{uri}">{transforms}
+<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/>
+</ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature>"#
+    );
+    let mut signing_policy = xml_sec::policy::SigningPolicy::default();
+    signing_policy.uris.references = UriTypeSet::ALL;
+    let xml = SignContext::new(&signer)
+        .policy(signing_policy)
+        .external_resources(&resources)
+        .sign_template(&template)
+        .unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    let context = VerifyContext::new()
+        .key(&key)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .process_manifests(true);
+    with_verified_request(&document, &context, &request, &account(), |session| {
+        let current = account();
+        let signature = session.evidence().signatures()[0].identity();
+        let reference = session.view().node_for_id("inside", &[]).unwrap();
+        let before = current.work_used();
+        session
+            .with_query(signature, &current, |selected| {
+                selected.replay_reference(
+                    reference,
+                    ReplayMode::ReferenceOutput,
+                    &mut |bytes: &[u8]| {
+                        assert_eq!(bytes, expected);
+                        Ok::<_, ()>(())
+                    },
+                )
+            })
+            .unwrap();
+        let cost = current.work_used() - before;
+        assert!(
+            cost > 3 * input_length,
+            "input scanning and decoding were charged"
+        );
+        assert_eq!(current.used(), 0);
+        for (limit, succeeds) in [(cost, true), (cost - 1, false), (0, false)] {
+            let query = Parser::new(
+                Encoding::Der,
+                Limits {
+                    max_work: limit as u64,
+                    ..Default::default()
+                },
+                current.clone(),
+            );
+            let reader = query.read(&[], 0).unwrap();
+            let work = reader.execution();
+            let mut called = false;
+            let before = current.work_used();
+            let outcome = session.with_query(signature, &work, |selected| {
+                selected.replay_reference(
+                    reference,
+                    ReplayMode::ReferenceOutput,
+                    &mut |bytes: &[u8]| {
+                        called = true;
+                        assert_eq!(bytes, expected);
+                        Ok::<_, ()>(())
+                    },
+                )
+            });
+            assert_eq!(outcome.is_ok(), succeeds);
+            assert_eq!(called, succeeds);
+            if succeeds {
+                assert_eq!(current.work_used() - before, cost);
+            }
+            assert_eq!(current.used(), 0);
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn replay_enforces_the_compiled_transform_count_before_output() {
     // A valid Signature authenticates even a Manifest instruction whose
     // execution exceeded policy. Replay must not turn that into permission.
@@ -589,6 +1065,276 @@ fn only_admitted_missing_external_data_is_unavailable() {
 }
 
 #[test]
+fn missing_id_replay_retains_diagnostic_capacity_until_error_drop() {
+    // A signed Manifest authenticates its instruction even when its ID is
+    // absent. The returned error must retain only admitted query storage.
+    let id = "x".repeat(65536);
+    let (xml, key) = signed_manifest(
+        &format!("#{id}"),
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        "",
+    );
+    let document = XmlDocument::parse(xml).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let current = account();
+            let error = session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("missing ID cannot produce bytes")
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                current.used() >= id.len(),
+                "escaping diagnostic retains its capacity charge"
+            );
+            assert!(format!("{error:?}").contains(&id));
+            drop(error);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn replay_layout_charges_inspected_whitespace_by_length() {
+    // Legal whitespace inside an authenticated Reference is still scanned by
+    // the current query, so its work must grow with the text, not the node count.
+    let work = |whitespace: usize| {
+        let (xml, key) = signed_manifest(
+            "#target",
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            &" ".repeat(whitespace),
+        );
+        let document = XmlDocument::parse(xml).unwrap();
+        let context = VerifyContext::new().key(&key).process_manifests(true);
+        let current = account();
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &current,
+                        |selected| {
+                            selected.replay_reference(
+                                session.view().node_for_id("inside", &[]).unwrap(),
+                                ReplayMode::ReferenceOutput,
+                                &mut |_: &[u8]| Ok::<_, ()>(()),
+                            )
+                        },
+                    )
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        current.work_used()
+    };
+    // ID lookups use randomly seeded tables, so unrelated probes vary by a
+    // few units per run; the slack is three orders below the scanned text.
+    let length = 1 << 20;
+    let slack = 1024;
+    assert!(work(length) + slack >= work(1) + length);
+}
+
+#[test]
+fn replay_layout_diagnostic_retains_current_capacity_until_error_drop() {
+    // A signed Manifest authenticates a malformed Reference too. Its trailing
+    // element name is attacker-sized, so the escaping diagnostic must stay
+    // funded by the query that built it until the error is dropped.
+    let name = "x".repeat(65536);
+    let secret = vec![0x61; 32];
+    let signer = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let template = manifest_template("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "")
+        .replace(
+            "</ds:DigestValue></ds:Reference>\n</ds:Manifest>",
+            &format!("</ds:DigestValue><{name}/></ds:Reference>\n</ds:Manifest>"),
+        );
+    let xml = SignContext::new(&signer).sign_template(&template).unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let current = account();
+            let error = session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            ReplayMode::ReferenceOutput,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("malformed Reference cannot produce bytes")
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(format!("{error:?}").contains(&name));
+            assert!(
+                current.used() >= name.len(),
+                "escaping diagnostic retains its capacity charge"
+            );
+            drop(error);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+/// Replays `inside` in one funded query that must fail, and checks that the
+/// escaping diagnostic names `text` and keeps its charge until it is dropped.
+fn assert_query_diagnostic_retained(
+    document: &XmlDocument,
+    context: &VerifyContext<'_>,
+    timestamp: bool,
+    text: &str,
+) {
+    with_verified_request(
+        document,
+        context,
+        &VerificationRequest::default(),
+        &account(),
+        |session| {
+            let mode = if timestamp {
+                ReplayMode::Timestamp(session.view().node_for_id("timestamp-method", &[]).unwrap())
+            } else {
+                ReplayMode::ReferenceOutput
+            };
+            let current = account();
+            let error = session
+                .with_query(
+                    session.evidence().signatures()[0].identity(),
+                    &current,
+                    |selected| {
+                        selected.replay_reference(
+                            session.view().node_for_id("inside", &[]).unwrap(),
+                            mode,
+                            &mut |_: &[u8]| -> Result<(), ()> {
+                                panic!("rejected instruction cannot produce bytes")
+                            },
+                        )
+                    },
+                )
+                .unwrap_err();
+            assert!(format!("{error:?}").contains(text));
+            assert!(
+                current.used() >= text.len(),
+                "escaping diagnostic retains its capacity charge"
+            );
+            drop(error);
+            assert_eq!(current.used(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn replay_transform_policy_diagnostic_retains_current_capacity_until_error_drop() {
+    // An authenticated transform outside the allowlist names an attacker-sized
+    // URI; the escaping policy rejection must stay funded by the query.
+    let algorithm = format!("urn:example:{}", "x".repeat(65536));
+    let (xml, key) = signed_manifest(
+        "#target",
+        "http://www.w3.org/2001/04/xmlenc#sha256",
+        &format!(r#"<ds:Transforms><ds:Transform Algorithm="{algorithm}"/></ds:Transforms>"#),
+    );
+    let document = XmlDocument::parse(xml).unwrap();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.manifest_processing = xml_sec::policy::ManifestProcessing::Process;
+    policy.transforms.allowed_algorithms =
+        Some(["http://www.w3.org/2001/10/xml-exc-c14n#".to_owned()].into());
+    let context = VerifyContext::new().key(&key).policy(policy);
+    assert_query_diagnostic_retained(&document, &context, false, &algorithm);
+}
+
+const TIMESTAMP_METHOD: &str = r#"<ds:CanonicalizationMethod Id="timestamp-method" Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#;
+
+#[test]
+fn timestamp_method_whitespace_is_charged_by_length() {
+    // The timestamp method is parsed by the current query, so legal whitespace
+    // inside it must cost its bytes rather than run on unfunded work.
+    let work = |whitespace: usize| {
+        let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+        let method = TIMESTAMP_METHOD.replace(
+            "/>",
+            &format!(">{}</ds:CanonicalizationMethod>", " ".repeat(whitespace)),
+        );
+        let document = XmlDocument::parse(xml.replace(TIMESTAMP_METHOD, &method)).unwrap();
+        let context = VerifyContext::new().key(&key).process_manifests(true);
+        let current = account();
+        with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &account(),
+            |session| {
+                let method = session.view().node_for_id("timestamp-method", &[]).unwrap();
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &current,
+                        |selected| {
+                            selected.replay_reference(
+                                session.view().node_for_id("inside", &[]).unwrap(),
+                                ReplayMode::Timestamp(method),
+                                &mut |_: &[u8]| Ok::<_, ()>(()),
+                            )
+                        },
+                    )
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        current.work_used()
+    };
+    // Same randomized ID-table slack as the Reference layout check.
+    let length = 1 << 20;
+    let slack = 1024;
+    assert!(work(length) + slack >= work(1) + length);
+}
+
+#[test]
+fn timestamp_method_diagnostic_retains_current_capacity_until_error_drop() {
+    // An unsupported timestamp method URI is attacker-sized; its diagnostic
+    // must be built in the query's storage, not copied outside it.
+    let algorithm = format!("urn:example:{}", "x".repeat(65536));
+    let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
+    let method = TIMESTAMP_METHOD.replace("http://www.w3.org/2001/10/xml-exc-c14n#", &algorithm);
+    let document = XmlDocument::parse(xml.replace(TIMESTAMP_METHOD, &method)).unwrap();
+    let context = VerifyContext::new().key(&key).process_manifests(true);
+    assert_query_diagnostic_retained(&document, &context, true, &algorithm);
+}
+
+#[test]
 fn final_octets_are_borrowed_and_not_timestamp_recanonicalized() {
     // Final binary, including empty/non-XML input, is not XML-decoded merely
     // because a timestamp method was supplied. Pointer identity proves no copy.
@@ -1060,6 +1806,150 @@ fn external_xml_replay_uses_the_original_binary_to_xml_adapter() {
         assert_eq!(output, b"<q:root xmlns:q=\"urn:payload\" a=\"1\" z=\"2\"><!--keep--><q:child></q:child></q:root>");
         Ok(())
     }).unwrap();
+}
+
+#[test]
+fn external_xml_xpath_replay_keeps_namespace_axes_and_original_id_rules() {
+    // Both XPath forms must consume the current parser's actual semantic DOM,
+    // retaining independent attribute/namespace axes and its ID classification.
+    let uri = "https://example.test/xpath-current-dom";
+    let payload =
+        b"<r xmlns:p='urn:p'><p:leaf Id='a'>left</p:leaf><p:leaf Id='b'>right</p:leaf></r>";
+    for parameter in [
+        r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(ancestor-or-self::node() | id('a')) = count(ancestor-or-self::node())</ds:XPath></ds:Transform>"#,
+        r#"<ds:Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2"><f:XPath xmlns:f="http://www.w3.org/2002/06/xmldsig-filter2" Filter="intersect">id('a')</f:XPath></ds:Transform>"#,
+    ] {
+        let transforms = format!(
+            r#"<ds:Transforms>{parameter}<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>"#
+        );
+        let (xml, key) =
+            signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", &transforms);
+        let resources = HashMap::from([(uri.to_owned(), payload.to_vec())]);
+        let request = VerificationRequest {
+            external_resources: Some(&resources),
+            ..Default::default()
+        };
+        for backend in backends() {
+            let document = XmlDocument::parse_with_backend(xml.clone(), backend).unwrap();
+            let context = VerifyContext::new()
+                .xml_backend(backend)
+                .key(&key)
+                .allowed_uri_types(UriTypeSet::ALL)
+                .process_manifests(true);
+            with_verified_request(&document, &context, &request, &account(), |session| {
+                let current = account();
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &current,
+                        |selected| {
+                            let mut output = Vec::new();
+                            assert_eq!(
+                                selected
+                                    .replay_reference(
+                                        session.view().node_for_id("inside", &[]).unwrap(),
+                                        ReplayMode::ReferenceOutput,
+                                        &mut |chunk: &[u8]| {
+                                            output.extend_from_slice(chunk);
+                                            Ok::<_, ()>(())
+                                        },
+                                    )
+                                    .unwrap(),
+                                ReplayOutcome::Complete
+                            );
+                            assert_eq!(output, b"<p:leaf xmlns:p=\"urn:p\" Id=\"a\">left</p:leaf>");
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(current.used(), 0);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn current_query_replays_opc_with_the_original_edition_after_producer_exhaustion() {
+    // Real authenticated instructions retain their policy edition while both
+    // relationship normalization and terminal C14N use only the current Work.
+    use structured_asn1::{Encoding, Limits, Parser, memory::Work as _};
+    use xml_sec::policy::{OpcRelationshipEdition, VerificationPolicy};
+    let uri = "https://example.test/current-relationships";
+    let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://schemas.openxmlformats.org/package/2006/RelationshipTransform"><r:RelationshipReference xmlns:r="http://schemas.openxmlformats.org/package/2006/digital-signature" SourceId="keep"/></ds:Transform><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms>"#;
+    let payload = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="drop" Type="urn:other" Target="discard"/><Relationship Id="keep" Type="urn:test" Target="part.xml"/></Relationships>"#;
+    let expected = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="keep" Target="part.xml" TargetMode="Internal" Type="urn:test"></Relationship></Relationships>"#;
+    let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
+    let resources = HashMap::from([(uri.to_owned(), payload.to_vec())]);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    for backend in backends() {
+        for edition in [
+            OpcRelationshipEdition::Ecma2012,
+            OpcRelationshipEdition::Ecma2021,
+        ] {
+            let memory = account();
+            let producer = Parser::new(
+                Encoding::Der,
+                Limits {
+                    max_work: 1 << 20,
+                    ..Default::default()
+                },
+                memory.clone(),
+            );
+            let reader = producer.read(&[], 0).unwrap();
+            let work = reader.execution();
+            let mut policy = VerificationPolicy::default();
+            policy.transforms.opc_relationship_edition = edition;
+            let document = XmlDocument::parse_with_backend(xml.clone(), backend).unwrap();
+            let context = VerifyContext::new()
+                .policy(policy)
+                .xml_backend(backend)
+                .key(&key)
+                .allowed_uri_types(UriTypeSet::ALL)
+                .process_manifests(true);
+            with_verified_request(&document, &context, &request, &work, |session| {
+                for shift in (0..=20).rev() {
+                    while work.charge_work(1 << shift).is_ok() {}
+                }
+                let retained = memory.used();
+                let current = Parser::new(Encoding::Der, Limits::default(), memory.clone());
+                let reader = current.read(&[], 0).unwrap();
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &reader.execution(),
+                        |selected| {
+                            let mut output = Vec::new();
+                            assert_eq!(
+                                selected
+                                    .replay_reference(
+                                        session.view().node_for_id("inside", &[]).unwrap(),
+                                        ReplayMode::ReferenceOutput,
+                                        &mut |chunk: &[u8]| {
+                                            output.extend_from_slice(chunk);
+                                            Ok::<_, ()>(())
+                                        }
+                                    )
+                                    .unwrap(),
+                                ReplayOutcome::Complete
+                            );
+                            assert_eq!(output, expected);
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap();
+                assert!(work.charge_work(1).is_err());
+                assert_eq!(memory.used(), retained);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(memory.used(), 0);
+        }
+    }
 }
 
 #[test]

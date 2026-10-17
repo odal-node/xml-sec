@@ -831,11 +831,22 @@ pub enum ParseError {
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
 
+    /// Invalid structure whose diagnostic retains its current-query capacity charge.
+    #[error("invalid structure: {0}")]
+    AccountedInvalidStructure(structured_asn1::memory::OwnedText),
+
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
     UnsupportedAlgorithm {
         /// The unrecognized algorithm URI.
         uri: String,
+    },
+
+    /// Unsupported algorithm whose URI retains its current-query capacity charge.
+    #[error("unsupported algorithm: {uri}")]
+    AccountedUnsupportedAlgorithm {
+        /// The unrecognized algorithm URI.
+        uri: structured_asn1::memory::OwnedText,
     },
 
     /// Base64 decode error.
@@ -1286,11 +1297,8 @@ pub(crate) fn parse_reference_with_xpath_budget(
     })
 }
 
-pub(crate) fn reference_layout<'a>(
-    node: Node<'a, 'a>,
-) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ParseError> {
-    inspect_reference_layout(node).map_err(ReferenceLayoutFault::diagnostic)
-}
+/// Optional `<Transforms>`, `<DigestMethod>` and `<DigestValue>` of one Reference.
+pub(crate) type ReferenceLayout<'a> = (Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>);
 
 #[derive(Debug)]
 pub(crate) enum ReferenceLayoutFault<'a, 'input> {
@@ -1302,14 +1310,22 @@ pub(crate) enum ReferenceLayoutFault<'a, 'input> {
 
 impl ReferenceLayoutFault<'_, '_> {
     fn diagnostic(self) -> ParseError {
+        self.diagnostic_in(&crate::c14n::scratch::Native)
+    }
+
+    /// Element names are attacker-sized, so a query-funded caller passes its
+    /// storage and the diagnostic stays charged to it until the error is dropped.
+    fn diagnostic_in<'s, S: transforms::ParseStorage<'s>>(self, storage: &S) -> ParseError {
         match self {
             Self::Missing(element) => ParseError::MissingElement { element },
-            Self::WrongElement(node, expected) => verify_ds_element(node, expected)
-                .expect_err("layout fault records a failed element check"),
-            Self::MixedContent => ParseError::InvalidStructure(
-                "Reference must not contain non-whitespace mixed content".into(),
-            ),
-            Self::TrailingElement(node) => ParseError::InvalidStructure(format!(
+            Self::WrongElement(node, expected) => {
+                element_mismatch(node, expected, XMLDSIG_NS, "ds", storage)
+                    .expect_err("layout fault records a failed element check")
+            }
+            Self::MixedContent => storage.structure(format_args!(
+                "Reference must not contain non-whitespace mixed content"
+            )),
+            Self::TrailingElement(node) => storage.structure(format_args!(
                 "unexpected element <{}> after <DigestValue> in <Reference>",
                 node.tag_name().name()
             )),
@@ -1329,19 +1345,39 @@ fn layout_element<'a, 'input>(
 }
 
 /// Structural inspection borrows faults without constructing diagnostic strings.
+/// The caller has already paid for the text this scans.
 pub(crate) fn inspect_reference_layout<'a>(
     node: Node<'a, 'a>,
-) -> Result<(Option<Node<'a, 'a>>, Node<'a, 'a>, Node<'a, 'a>), ReferenceLayoutFault<'a, 'a>> {
-    layout_element(node, "Reference")?;
+) -> Result<ReferenceLayout<'a>, ReferenceLayoutFault<'a, 'a>> {
+    match inspect_charged_reference_layout(node, |_| Ok::<(), core::convert::Infallible>(())) {
+        Ok(layout) => layout,
+        Err(never) => match never {},
+    }
+}
+
+/// Charges each text node's length before scanning it, so a single large
+/// whitespace node costs its bytes rather than one child.
+fn inspect_charged_reference_layout<'a, E>(
+    node: Node<'a, 'a>,
+    mut charge: impl FnMut(usize) -> Result<(), E>,
+) -> Result<Result<ReferenceLayout<'a>, ReferenceLayoutFault<'a, 'a>>, E> {
+    if let Err(fault) = layout_element(node, "Reference") {
+        return Ok(Err(fault));
+    }
     for child in node.children() {
-        if child.is_text()
-            && child
-                .text()
-                .is_some_and(|text| !is_xml_whitespace_only(text))
-        {
-            return Err(ReferenceLayoutFault::MixedContent);
+        if let Some(text) = child.text().filter(|_| child.is_text()) {
+            charge(text.len())?;
+            if !is_xml_whitespace_only(text) {
+                return Ok(Err(ReferenceLayoutFault::MixedContent));
+            }
         }
     }
+    Ok(layout_reference_children(node))
+}
+
+fn layout_reference_children<'a>(
+    node: Node<'a, 'a>,
+) -> Result<ReferenceLayout<'a>, ReferenceLayoutFault<'a, 'a>> {
     let mut children = element_children(node);
     let (transforms, method) = layout_transforms_and_digest_method(&mut children)?;
     let value = layout_digest_value(&mut children)?;
@@ -1383,15 +1419,28 @@ fn layout_finish<'a, 'input>(
 /// Replay processes the original instruction but does not compute or select
 /// its historical digest algorithm (EN 319 132-1 V1.3.1 §5.5.3 Note 2).
 /// Layout validation is shared with ordinary Reference parsing.
-pub(crate) fn parse_replay_transforms(
-    node: Node<'_, '_>,
+pub(crate) fn parse_replay_transforms<'a, S: transforms::ParseStorage<'a>>(
+    node: Node<'a, 'a>,
     budget: &mut transforms::XPathSignatureParseBudget,
-) -> Result<Vec<transforms::Transform>, ParseError> {
-    let (transforms, method, _) = reference_layout(node)?;
+    scratch: &S,
+) -> Result<S::Values<S::Instruction>, ParseError> {
+    scratch
+        .charge(node.children().len())
+        .map_err(super::types::TransformError::from)?;
+    let (transforms, method, _) =
+        inspect_charged_reference_layout(node, |bytes| scratch.charge(bytes))
+            .map_err(super::types::TransformError::from)?
+            .map_err(|fault| fault.diagnostic_in(scratch))?;
+    scratch
+        .charge(method.attributes().len())
+        .map_err(super::types::TransformError::from)?;
     required_algorithm_attr(method, "DigestMethod")?;
     transforms.map_or_else(
-        || Ok(Vec::new()),
-        |node| transforms::parse_transforms_with_budget(node, budget).map_err(Into::into),
+        || Ok(scratch.values()),
+        |node| {
+            transforms::parse_reference_transforms_in(node, XMLDSIG_NS, budget, scratch)
+                .map_err(Into::into)
+        },
     )
 }
 
@@ -1932,20 +1981,38 @@ fn verify_namespaced_element(
     expected_namespace: &'static str,
     diagnostic_prefix: &'static str,
 ) -> Result<(), ParseError> {
+    element_mismatch(
+        node,
+        expected_name,
+        expected_namespace,
+        diagnostic_prefix,
+        &crate::c14n::scratch::Native,
+    )
+}
+
+fn element_mismatch<'s, S: transforms::ParseStorage<'s>>(
+    node: Node,
+    expected_name: &'static str,
+    expected_namespace: &'static str,
+    diagnostic_prefix: &'static str,
+    storage: &S,
+) -> Result<(), ParseError> {
     if !node.is_element() {
-        return Err(ParseError::InvalidStructure(format!(
+        return Err(storage.structure(format_args!(
             "expected element <{expected_name}>, got non-element node"
         )));
     }
     let tag = node.tag_name();
     if tag.name() != expected_name || tag.namespace() != Some(expected_namespace) {
-        return Err(ParseError::InvalidStructure(format!(
-            "expected <{diagnostic_prefix}:{expected_name}>, got <{}{}>",
-            tag.namespace()
-                .map(|ns| format!("{{{ns}}}"))
-                .unwrap_or_default(),
-            tag.name()
-        )));
+        let name = tag.name();
+        return Err(match tag.namespace() {
+            Some(namespace) => storage.structure(format_args!(
+                "expected <{diagnostic_prefix}:{expected_name}>, got <{{{namespace}}}{name}>"
+            )),
+            None => storage.structure(format_args!(
+                "expected <{diagnostic_prefix}:{expected_name}>, got <{name}>"
+            )),
+        });
     }
     Ok(())
 }
@@ -1989,37 +2056,53 @@ fn parse_inclusive_prefixes<'a>(node: Node<'a, '_>) -> Result<Option<&'a str>, P
 }
 
 /// Read the original timestamp method, not a caller-supplied algorithm hint.
-pub(crate) fn parse_replay_canonicalization_method<'a>(
+/// The current query pays for every inspected node and owns each diagnostic.
+pub(crate) fn parse_replay_canonicalization_method<'a, 's, S: transforms::ParseStorage<'s>>(
     node: Node<'a, '_>,
+    scratch: &S,
 ) -> Result<(C14nAlgorithm, Option<&'a str>), ParseError> {
-    verify_ds_element(node, "CanonicalizationMethod")?;
-    ensure_no_non_whitespace_text(node, "CanonicalizationMethod")?;
-    let uri = required_algorithm_attr(node, "CanonicalizationMethod")?;
+    element_mismatch(node, "CanonicalizationMethod", XMLDSIG_NS, "ds", scratch)?;
+    ensure_charged_whitespace_text(node, "CanonicalizationMethod", scratch)?;
+    scratch
+        .charge(node.attributes().len())
+        .map_err(super::types::TransformError::from)?;
+    let uri = node.attribute("Algorithm").ok_or_else(|| {
+        scratch.structure(format_args!(
+            "missing Algorithm attribute on <CanonicalizationMethod>"
+        ))
+    })?;
     let algorithm =
-        C14nAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
-            uri: uri.to_string(),
-        })?;
-    let mut parameter_seen = false;
+        C14nAlgorithm::from_uri(uri).ok_or_else(|| scratch.unsupported_algorithm(uri))?;
+    let mut prefixes = None;
     for child in element_children(node) {
         // Exclusive C14N §4 defines one empty InclusiveNamespaces parameter;
         // other known algorithms here have no parameter grammar.
         // https://www.w3.org/TR/2002/REC-xml-exc-c14n-20020718/#def-InclusiveNamespaces-PrefixList
-        if parameter_seen
+        if prefixes.is_some()
             || algorithm.mode() != crate::c14n::C14nMode::Exclusive1_0
             || !child.has_tag_name((
                 "http://www.w3.org/2001/10/xml-exc-c14n#",
                 "InclusiveNamespaces",
             ))
         {
-            return Err(ParseError::InvalidStructure(
-                "invalid canonicalization parameter".into(),
-            ));
+            return Err(scratch.structure(format_args!("invalid canonicalization parameter")));
         }
-        ensure_no_element_children(child, "InclusiveNamespaces")?;
-        ensure_no_non_whitespace_text(child, "InclusiveNamespaces")?;
-        parameter_seen = true;
+        ensure_charged_whitespace_text(child, "InclusiveNamespaces", scratch)?;
+        if child.children().any(|child| child.is_element()) {
+            return Err(scratch.structure(format_args!(
+                "InclusiveNamespaces must not contain child elements"
+            )));
+        }
+        scratch
+            .charge(child.attributes().len())
+            .map_err(super::types::TransformError::from)?;
+        prefixes = Some(child.attribute("PrefixList").ok_or_else(|| {
+            scratch.structure(format_args!(
+                "missing PrefixList attribute on <InclusiveNamespaces>"
+            ))
+        })?);
     }
-    Ok((algorithm, parse_inclusive_prefixes(node)?))
+    Ok((algorithm, prefixes))
 }
 
 pub(crate) fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
@@ -3792,13 +3875,28 @@ fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<
 }
 
 fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
-    for child in node.children().filter(|child| child.is_text()) {
-        if let Some(text) = child.text()
-            && !is_xml_whitespace_only(text)
-        {
-            return Err(ParseError::InvalidStructure(format!(
-                "{element_name} must not contain non-whitespace mixed content"
-            )));
+    ensure_charged_whitespace_text(node, element_name, &crate::c14n::scratch::Native)
+}
+
+/// Charges the child count and each text node's length before scanning it.
+fn ensure_charged_whitespace_text<'s, S: transforms::ParseStorage<'s>>(
+    node: Node<'_, '_>,
+    element_name: &str,
+    storage: &S,
+) -> Result<(), ParseError> {
+    storage
+        .charge(node.children().len())
+        .map_err(super::types::TransformError::from)?;
+    for child in node.children() {
+        if let Some(text) = child.text().filter(|_| child.is_text()) {
+            storage
+                .charge(text.len())
+                .map_err(super::types::TransformError::from)?;
+            if !is_xml_whitespace_only(text) {
+                return Err(storage.structure(format_args!(
+                    "{element_name} must not contain non-whitespace mixed content"
+                )));
+            }
         }
     }
     Ok(())
@@ -3807,6 +3905,32 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
+    #[test]
+    fn replay_layout_admits_ignored_siblings_under_current_work() {
+        // Comments do not change Reference grammar, but ignoring them is still
+        // a current-query traversal, not work prepaid by the original parser.
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let cost = |comments: usize| {
+            let source = format!(
+                "<Reference xmlns='{XMLDSIG_NS}'>{}<DigestMethod Algorithm='urn:historical'/><DigestValue/></Reference>",
+                "<!--ignored-->".repeat(comments)
+            );
+            let document = Document::parse(&source).expect("fixed Reference layout");
+            let current = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+            let transforms = parse_replay_transforms(
+                document.root_element(),
+                &mut transforms::XPathSignatureParseBudget::default(),
+                &crate::c14n::scratch::Accounted(&current),
+            )
+            .expect("valid empty transform chain");
+            assert!(transforms.is_empty());
+            drop(transforms);
+            assert_eq!(current.used(), 0);
+            current.work_used()
+        };
+        assert!(cost(1024) >= cost(1) + 1023);
+    }
+
     #[test]
     fn inspected_reference_layout_errors_do_not_own_diagnostics() {
         // Metadata classification borrows its original malformed source and
