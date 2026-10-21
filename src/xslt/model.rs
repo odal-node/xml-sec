@@ -1,17 +1,21 @@
+#[cfg(feature = "embedded")]
+use crate::xml_input_shared as xml_sec_xml_input;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
-use crate::budget::{
-    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, append_metered_string,
-    ensure, reserve_temporary_vec_slot,
+use super::budget::{
+    ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, ParseWork,
+    append_metered_string, ensure, reserve_temporary_vec_slot,
 };
-use crate::{BudgetKind, Error, ParseBudget, Result};
+use super::{BudgetKind, Error, ParseBudget, ParseUsage, Reported, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
+
+mod lexical_storage;
 
 pub(crate) fn parser_workspace_bytes(xml: &str) -> usize {
     let (node_slots, attribute_slots) =
@@ -154,6 +158,7 @@ pub struct Document {
     root: NodeId,
     logical_roots: Vec<NodeId>,
     source_bytes: usize,
+    retained_bytes: usize,
     ids: HashMap<(NodeId, String), NodeId>,
     unparsed_entities: HashMap<(NodeId, String), String>,
 }
@@ -212,36 +217,41 @@ fn estimated_node_clone_bytes(node: &Node) -> usize {
                 .len()
                 .saturating_mul(std::mem::size_of::<NodeId>()),
         )
-        .saturating_add(node.base_uri.as_deref().map_or(0, str::len))
-        .saturating_add(match &node.kind {
-            NodeKind::Root => 0,
-            NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
-            NodeKind::ProcessingInstruction { target, value } => target
-                .len()
-                .saturating_add(value.as_deref().map_or(0, str::len)),
-            NodeKind::Element {
-                name,
-                prefix,
-                attributes,
-                namespaces: _,
-            } => name
-                .local
-                .len()
-                .saturating_add(name.namespace.as_deref().map_or(0, str::len))
-                .saturating_add(prefix.as_deref().map_or(0, str::len))
-                .saturating_add(
-                    attributes
-                        .len()
-                        .saturating_mul(std::mem::size_of::<Attribute>()),
-                )
-                .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
-                    total
-                        .saturating_add(attribute.name.local.len())
-                        .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
-                        .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
-                        .saturating_add(attribute.value.len())
-                })),
-        })
+        .saturating_add(node_payload_bytes(&node.kind, node.base_uri.as_deref()))
+}
+
+/// Heap bytes a node's kind and base URI hold, apart from its arena slot,
+/// child list and shared namespace scope.
+fn node_payload_bytes(kind: &NodeKind, base_uri: Option<&str>) -> usize {
+    base_uri.map_or(0, str::len).saturating_add(match kind {
+        NodeKind::Root => 0,
+        NodeKind::Text { value, .. } | NodeKind::Comment(value) => value.len(),
+        NodeKind::ProcessingInstruction { target, value } => target
+            .len()
+            .saturating_add(value.as_deref().map_or(0, str::len)),
+        NodeKind::Element {
+            name,
+            prefix,
+            attributes,
+            namespaces: _,
+        } => name
+            .local
+            .len()
+            .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+            .saturating_add(prefix.as_deref().map_or(0, str::len))
+            .saturating_add(
+                attributes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Attribute>()),
+            )
+            .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
+                total
+                    .saturating_add(attribute.name.local.len())
+                    .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
+                    .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
+                    .saturating_add(attribute.value.capacity())
+            })),
+    })
 }
 
 fn retained_node_backing_bytes(node: &Node) -> usize {
@@ -310,8 +320,29 @@ impl Document {
         base_uri: Option<&str>,
         budget: ParseBudget,
     ) -> Result<Self> {
-        ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
-        Self::parse_iterative_bounded(xml, base_uri, budget)
+        Self::parse_with_budget_reported(xml, base_uri, budget).outcome
+    }
+
+    /// [`Self::parse_with_budget`], also reporting the parser work it admitted.
+    pub fn parse_with_budget_reported(
+        xml: &str,
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+    ) -> Reported<Self, ParseUsage> {
+        let mut work = ParseWork::new(budget.parse_work_bytes);
+        let outcome = ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())
+            .and_then(|()| Self::parse_iterative_bounded(xml, base_uri, budget, &mut work));
+        Reported {
+            outcome,
+            usage: work.usage(),
+        }
+    }
+
+    /// Bytes this tree retains, as its bounded parse charged them; zero for a
+    /// document parsed without a budget.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     /// Decode and parse trusted XML bytes without a caller-selected resource budget.
@@ -319,7 +350,7 @@ impl Document {
     /// Use [`Self::parse_bytes_with_budget`] for untrusted input.
     pub fn parse_bytes(bytes: &[u8], base_uri: Option<&str>) -> Result<Self> {
         let xml =
-            xml_sec_xml_input::decode_xml(bytes, None).map_err(crate::error::decoded_xml_error)?;
+            xml_sec_xml_input::decode_xml(bytes, None).map_err(super::error::decoded_xml_error)?;
         Self::parse_iterative(&xml, base_uri)
     }
 
@@ -339,7 +370,12 @@ impl Document {
                 error => Error::Xml(error.to_string()),
             },
         )?;
-        Self::parse_iterative_bounded(&xml, base_uri, budget)
+        Self::parse_iterative_bounded(
+            &xml,
+            base_uri,
+            budget,
+            &mut ParseWork::new(budget.parse_work_bytes),
+        )
     }
 
     // Account for heap storage materialized by Clone before duplicating the source document.
@@ -519,10 +555,10 @@ impl Document {
                 .ok_or_else(|| Error::Xml("parsed node has no projected parent".into()))?;
             let kind = if source.is_element() {
                 let prefix = lexical_prefix(xml, source.range().start, source.tag_name().name());
-                if !crate::lexical::is_ncname(source.tag_name().name())
+                if !super::lexical::is_ncname(source.tag_name().name())
                     || prefix
                         .as_deref()
-                        .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                        .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
                 {
                     return Err(Error::Xml("invalid element QName".into()));
                 }
@@ -530,10 +566,10 @@ impl Document {
                     .attributes()
                     .map(|attribute| {
                         let prefix = attribute_prefix(xml, source, attribute);
-                        if !crate::lexical::is_ncname(attribute.name())
+                        if !super::lexical::is_ncname(attribute.name())
                             || prefix
                                 .as_deref()
-                                .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                                .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
                         {
                             return Err(Error::Xml("invalid attribute QName".into()));
                         }
@@ -549,7 +585,7 @@ impl Document {
                 for namespace in source.namespaces() {
                     if namespace
                         .name()
-                        .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                        .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
                     {
                         return Err(Error::Xml("invalid namespace prefix".into()));
                     }
@@ -603,7 +639,7 @@ impl Document {
                 .then(|| source.attribute((XML_NS, "base")))
                 .flatten()
             {
-                Some(crate::resolver::resolve_uri_reference(
+                Some(super::resolver::resolve_uri_reference(
                     inherited_base.as_deref(),
                     reference,
                 )?)
@@ -617,18 +653,25 @@ impl Document {
             }
             mapping.insert(source.id(), id);
         }
-        document.register_xml_ids()?;
+        document.register_xml_ids(None)?;
         Ok(document)
     }
 
     fn parse_iterative(xml: &str, base_uri: Option<&str>) -> Result<Self> {
-        Self::parse_iterative_bounded(xml, base_uri, ParseBudget::UNBOUNDED)
+        Self::parse_iterative_bounded(
+            xml,
+            base_uri,
+            ParseBudget::UNBOUNDED,
+            &mut ParseWork::new(usize::MAX),
+        )
     }
 
-    fn parse_iterative_bounded(
+    /// Parse within `budget`, charging each pass over the text to `work` first.
+    pub(crate) fn parse_iterative_bounded(
         xml: &str,
         base_uri: Option<&str>,
         budget: ParseBudget,
+        work: &mut ParseWork,
     ) -> Result<Self> {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum DocumentPhase {
@@ -640,6 +683,16 @@ impl Document {
 
         ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
         ensure(BudgetKind::SourceNodes, budget.source_nodes, 1)?;
+        let initial_owned = std::mem::size_of::<Node>()
+            .checked_add(std::mem::size_of::<NodeId>())
+            .and_then(|bytes| bytes.checked_add(base_uri.map_or(0, str::len)))
+            .ok_or(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: budget.owned_bytes,
+                actual: usize::MAX,
+            })?;
+        ensure(BudgetKind::OwnedBytes, budget.owned_bytes, initial_owned)?;
+        work.charge(base_uri.map_or(0, str::len))?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_bytes = xml.len();
         let mut meter = StreamParseMeter {
@@ -648,19 +701,46 @@ impl Document {
             entity_references: 0,
             entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
             namespace_scope_bytes: 0,
+            owned_bytes: initial_owned,
         };
-        let (parameter_expanded_xml, declarations) = internal_general_entities(
+        // Entity declarations and their expansion each take a pass over the
+        // document only when an internal subset can declare entities.
+        let subset = doctype_span(xml)?.is_some_and(|doctype| doctype.internal_subset.is_some());
+        if subset {
+            work.charge(xml.len())?;
+        }
+        meter.entity_expansion.parse_work = Some(work);
+        meter.entity_expansion.workspace = budget.owned_bytes - initial_owned;
+        let (parameter_expanded_xml, mut declarations) = internal_general_entities(
             xml,
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
+        if subset {
+            meter
+                .entity_expansion
+                .charge_parse_work(parameter_expanded_xml.len())?;
+        }
         let expanded_xml = expand_document_entities(
             parameter_expanded_xml.as_ref(),
             &declarations.general,
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
-        let mut reader = Scanner::new(expanded_xml.as_ref());
+        meter.entity_expansion.workspace = budget.owned_bytes;
+        meter
+            .entity_expansion
+            .charge_parse_work(expanded_xml.len())?;
+        let lexical_held = std::cell::Cell::new(0);
+        let lexical_temporary = std::cell::Cell::new(0);
+        let mut reader = Scanner::with_storage(
+            expanded_xml.as_ref(),
+            lexical_storage::Storage {
+                limit: budget.owned_bytes,
+                held: &lexical_held,
+                temporary: &lexical_temporary,
+            },
+        );
         let mut previous_event_offset = 0usize;
         let mut source_line = 1usize;
         let mut phase = DocumentPhase::Start;
@@ -668,14 +748,26 @@ impl Document {
         // constraint; section 5.1 does not require this non-validating parser to enforce it.
         // https://www.w3.org/TR/xml/#sec-prolog-dtd
         let mut saw_doctype = false;
-        let mut elements = vec![StreamElementFrame {
+        let mut elements = Vec::new();
+        reserve_charged(&mut elements, 1, &mut meter)?;
+        elements.push(StreamElementFrame {
             node: document.root,
             lexical_name: None,
-        }];
-        while let Some(event) = reader
-            .next_event()
-            .map_err(|error| Error::Xml(error.to_string()))?
-        {
+        });
+        loop {
+            lexical_held.set(
+                meter
+                    .retained_bytes()
+                    .saturating_add(meter.entity_expansion.used)
+                    .saturating_add(meter.entity_expansion.declaration_bytes),
+            );
+            let Some(event) = reader.next_event().map_err(|error| match error {
+                xml_sec_xml_input::lexical::Error::Resource(error) => error,
+                error => Error::Xml(error.to_string()),
+            })?
+            else {
+                break;
+            };
             let event_offset = event_range_start(&event);
             source_line = source_line.saturating_add(xml_line_endings(
                 &expanded_xml.as_bytes()[previous_event_offset..event_offset],
@@ -683,6 +775,11 @@ impl Document {
             previous_event_offset = event_offset;
             match event {
                 Event::Start(start) => {
+                    #[cfg(test)]
+                    expansion_workspace_tests::SCANNED_ATTRIBUTES
+                        .with(|count| count.set(count.get() + start.attributes.len()));
+                    let lexical_bytes = start.attributes.bytes();
+                    meter.charge_owned(lexical_bytes)?;
                     if elements.len() == 1 {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
@@ -698,8 +795,15 @@ impl Document {
                         &mut meter,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
+                    drop(start);
+                    meter.release_owned(lexical_bytes);
                 }
                 Event::Empty(start) => {
+                    #[cfg(test)]
+                    expansion_workspace_tests::SCANNED_ATTRIBUTES
+                        .with(|count| count.set(count.get() + start.attributes.len()));
+                    let lexical_bytes = start.attributes.bytes();
+                    meter.charge_owned(lexical_bytes)?;
                     if elements.len() == 1 {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
@@ -715,17 +819,20 @@ impl Document {
                         &mut meter,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
+                    drop(start);
+                    meter.release_owned(lexical_bytes);
                 }
                 Event::End { name, .. } => {
                     if elements.len() == 1 {
                         return Err(Error::Xml("unmatched closing element".into()));
                     }
-                    let closing_name = name.qualified();
                     let opening_name = elements
                         .last()
-                        .and_then(|frame| frame.lexical_name.as_deref())
+                        .and_then(|frame| frame.lexical_name)
                         .expect("non-root element frames retain their lexical name");
-                    if closing_name != opening_name {
+                    if name != opening_name {
+                        let closing_name = name.qualified();
+                        let opening_name = opening_name.qualified();
                         return Err(Error::Xml(format!(
                             "closing element `{closing_name}` does not match `{opening_name}`"
                         )));
@@ -736,16 +843,19 @@ impl Document {
                     }
                 }
                 Event::Text { text, .. } => {
-                    let value = normalize_xml_line_endings(text);
-                    if elements.len() == 1
-                        && !value.trim_matches([' ', '\t', '\r', '\n']).is_empty()
+                    if elements.len() == 1 && !text.trim_matches([' ', '\t', '\r', '\n']).is_empty()
                     {
                         return Err(Error::Xml(
                             "non-whitespace text outside the document element".into(),
                         ));
                     }
-                    if elements.len() > 1 && !value.is_empty() {
-                        let id = push_parsed_text(&mut document, &elements, value, &mut meter)?;
+                    if elements.len() > 1 && !text.is_empty() {
+                        let id = push_parsed_text(
+                            &mut document,
+                            &elements,
+                            ParsedText::Source(text),
+                            &mut meter,
+                        )?;
                         document.nodes[id.0].source_line.get_or_insert(source_line);
                     } else if phase == DocumentPhase::Start {
                         phase = DocumentPhase::Prolog;
@@ -760,7 +870,7 @@ impl Document {
                     let id = push_parsed_text(
                         &mut document,
                         &elements,
-                        normalize_xml_line_endings(text),
+                        ParsedText::Source(text),
                         &mut meter,
                     )?;
                     document.nodes[id.0].source_line.get_or_insert(source_line);
@@ -773,14 +883,16 @@ impl Document {
                         .last()
                         .expect("document frame remains present")
                         .node;
-                    let inherited_base =
-                        document.node(parent).and_then(|node| node.base_uri.clone());
                     meter.reserve_node()?;
-                    let id = document.push(
+                    let value = copy_parsed_text(ParsedText::Source(text), &mut meter)?;
+                    let inherited_base = copy_base_uri(&document, parent, &mut meter)?;
+                    let id = push_metered(
+                        &mut document,
                         parent,
-                        NodeKind::Comment(normalize_xml_line_endings(text)),
+                        NodeKind::Comment(value),
                         inherited_base,
-                    );
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::ProcessingInstruction {
@@ -793,17 +905,19 @@ impl Document {
                         .last()
                         .expect("document frame remains present")
                         .node;
-                    let inherited_base =
-                        document.node(parent).and_then(|node| node.base_uri.clone());
                     meter.reserve_node()?;
-                    let id = document.push(
+                    let target = copy_parsed_literal(target, &mut meter)?;
+                    let value = content
+                        .map(|text| copy_parsed_text(ParsedText::Source(text), &mut meter))
+                        .transpose()?;
+                    let inherited_base = copy_base_uri(&document, parent, &mut meter)?;
+                    let id = push_metered(
+                        &mut document,
                         parent,
-                        NodeKind::ProcessingInstruction {
-                            target: target.to_owned(),
-                            value: content.map(normalize_xml_line_endings),
-                        },
+                        NodeKind::ProcessingInstruction { target, value },
                         inherited_base,
-                    );
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line = Some(source_line);
                 }
                 Event::Reference {
@@ -816,16 +930,15 @@ impl Document {
                         ));
                     }
                     let value = match reference {
-                        "amp" => "&".into(),
-                        "apos" => "'".into(),
-                        "gt" => ">".into(),
-                        "lt" => "<".into(),
-                        "quot" => "\"".into(),
+                        "amp" => '&',
+                        "apos" => '\'',
+                        "gt" => '>',
+                        "lt" => '<',
+                        "quot" => '"',
                         value if value.starts_with('#') => {
                             xml_sec_xml_input::lexical::decode_numeric_character_reference(
                                 &value[1..],
                             )
-                            .map(String::from)
                             .map_err(|_| Error::Xml("invalid character reference".into()))?
                         }
                         name => {
@@ -834,7 +947,12 @@ impl Document {
                             )));
                         }
                     };
-                    let id = push_parsed_text(&mut document, &elements, value, &mut meter)?;
+                    let id = push_parsed_text(
+                        &mut document,
+                        &elements,
+                        ParsedText::Reference(value),
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line.get_or_insert(source_line);
                 }
                 Event::Declaration { .. } => {
@@ -865,16 +983,41 @@ impl Document {
         if phase != DocumentPhase::Epilog {
             return Err(Error::Xml("document element is missing".into()));
         }
-        for (name, system_identifier) in declarations.unparsed {
-            let uri = crate::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
+        let stack_bytes = elements.capacity() * std::mem::size_of::<StreamElementFrame>();
+        drop(elements);
+        drop(reader);
+        drop(expanded_xml);
+        meter.release_owned(stack_bytes);
+        let unparsed = std::mem::take(&mut declarations.unparsed);
+        for (name, system_identifier) in unparsed {
+            let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
+            // Transfer the name's existing admission rather than charging its allocation twice.
+            let name_bytes = name.capacity();
+            meter.entity_expansion.release_declarations(name_bytes);
+            declarations.owned_bytes -= name_bytes;
+            meter.charge_owned(name_bytes)?;
+            // Names are unique in `declarations`, so every entry is kept.
+            reserve_index_entry(&mut document.unparsed_entities, uri.capacity(), &mut meter)?;
             document.register_unparsed_entity(name, uri)?;
+            let released = system_identifier.capacity();
+            drop(system_identifier);
+            meter.entity_expansion.release_declarations(released);
+            declarations.owned_bytes -= released;
         }
-        document.register_xml_ids()?;
+        let declaration_bytes = declarations.owned_bytes;
+        drop(declarations);
+        meter
+            .entity_expansion
+            .release_declarations(declaration_bytes);
+        document.register_xml_ids(Some(&mut meter))?;
+        document.retained_bytes = meter.retained_bytes();
         Ok(document)
     }
 
     #[must_use]
     pub fn empty(base_uri: Option<String>) -> Self {
+        #[cfg(test)]
+        expansion_workspace_tests::CREATED_ROOTS.with(|count| count.set(count.get() + 1));
         static NEXT_DOCUMENT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         let identity = NEXT_DOCUMENT_IDENTITY.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -889,6 +1032,7 @@ impl Document {
             root: NodeId(0, identity),
             logical_roots: vec![NodeId(0, identity)],
             source_bytes: 0,
+            retained_bytes: 0,
             ids: HashMap::new(),
             unparsed_entities: HashMap::new(),
         }
@@ -1195,7 +1339,7 @@ impl Document {
         reference: &str,
     ) -> Result<Vec<(NodeId, Option<String>)>> {
         let inherited = self.node(owner).and_then(|node| node.base_uri.as_deref());
-        let owner_base = Some(crate::resolver::resolve_uri_reference(
+        let owner_base = Some(super::resolver::resolve_uri_reference(
             inherited, reference,
         )?);
         let mut updates = vec![(owner, owner_base)];
@@ -1208,7 +1352,7 @@ impl Document {
                     self.nodes[child.0].xml_base_reference().map_or_else(
                         || Ok(child_base.map(str::to_owned)),
                         |reference| {
-                            crate::resolver::resolve_uri_reference(child_base, reference).map(Some)
+                            super::resolver::resolve_uri_reference(child_base, reference).map(Some)
                         },
                     )?
                 };
@@ -1259,21 +1403,37 @@ impl Document {
             .map(|((root, name), uri)| (name.as_str(), uri.as_str(), *root))
     }
 
-    fn register_xml_ids(&mut self) -> Result<()> {
-        let attributes = self
+    /// Index every `xml:id`; a bounded parse passes its meter, which admits the
+    /// index's storage and the list of owners before either is allocated.
+    fn register_xml_ids(&mut self, mut meter: Option<&mut StreamParseMeter>) -> Result<()> {
+        let is_xml_id = |attribute: &Attribute| {
+            attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "id"
+        };
+        let owners = self
             .nodes()
-            .filter_map(|(owner, node)| match &node.kind {
+            .filter(|(_, node)| match &node.kind {
+                NodeKind::Element { attributes, .. } => attributes.iter().any(is_xml_id),
+                _ => false,
+            })
+            .count();
+        // One entry per element that already counts as a node, so this cannot overflow.
+        let list_bytes = owners * std::mem::size_of::<(NodeId, usize)>();
+        if let Some(meter) = meter.as_deref_mut() {
+            meter.charge_owned(list_bytes)?;
+        }
+        let mut attributes = Vec::new();
+        attributes.try_reserve_exact(owners).map_err(|error| {
+            Error::Dynamic(format!("failed to reserve xml:id storage: {error}"))
+        })?;
+        attributes.extend(self.nodes().filter_map(|(owner, node)| {
+            match &node.kind {
                 NodeKind::Element { attributes, .. } => attributes
                     .iter()
-                    .position(|attribute| {
-                        attribute.name.namespace.as_deref()
-                            == Some("http://www.w3.org/XML/1998/namespace")
-                            && attribute.name.local == "id"
-                    })
+                    .position(is_xml_id)
                     .map(|index| (owner, index)),
                 _ => None,
-            })
-            .collect::<Vec<_>>();
+            }
+        }));
         for (owner, index) in attributes {
             let value = self
                 .node_mut(owner)
@@ -1286,7 +1446,21 @@ impl Document {
             if value.value != normalized {
                 value.value.clone_from(&normalized);
             }
+            let key_bytes = normalized.capacity();
+            if let Some(meter) = meter.as_deref_mut() {
+                reserve_index_entry(&mut self.ids, key_bytes, meter)?;
+            }
+            let indexed = self.ids.len();
             self.register_id_value(owner, normalized)?;
+            if let Some(meter) = meter.as_deref_mut()
+                && self.ids.len() == indexed
+            {
+                // The owner already held this ID; the key was dropped.
+                meter.release_owned(key_bytes);
+            }
+        }
+        if let Some(meter) = meter {
+            meter.release_owned(list_bytes);
         }
         Ok(())
     }
@@ -1818,7 +1992,7 @@ pub(crate) fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     let normalized = collapse_xml_whitespace(value);
     // xml:id 1.0 section 4 requires validation after whitespace normalization.
     // https://www.w3.org/TR/xml-id/#processing
-    if !crate::lexical::is_ncname(&normalized) {
+    if !super::lexical::is_ncname(&normalized) {
         return Err(Error::Xml(format!(
             "xml:id value `{normalized}` is not a valid NCName"
         )));
@@ -1826,11 +2000,14 @@ pub(crate) fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     Ok(normalized)
 }
 
-pub(crate) fn prepare_xml_frontend_bounded(
-    xml: &str,
+/// Expand and strip the internal subset for the frontend parser, charging each
+/// pass over the text to `work` first.
+pub(crate) fn prepare_xml_frontend_bounded<'a>(
+    xml: &'a str,
     limit: usize,
     recursion_depth: usize,
-) -> Result<Cow<'_, str>> {
+    work: &mut ParseWork,
+) -> Result<Cow<'a, str>> {
     let mut entity_references = 0;
     let mut entity_expansion = EntityExpansionMeter::with_limits(
         BudgetKind::OwnedBytes,
@@ -1838,8 +2015,19 @@ pub(crate) fn prepare_xml_frontend_bounded(
         usize::MAX,
         recursion_depth.min(ENTITY_EXPANSION_DEPTH_CEILING),
     );
+    entity_expansion.workspace = limit;
+    entity_expansion.workspace_maximum = limit;
+    // Without an internal subset there are no declarations to read or expand.
+    let subset = doctype_span(xml)?.is_some_and(|doctype| doctype.internal_subset.is_some());
+    if subset {
+        work.charge(xml.len())?;
+    }
+    entity_expansion.parse_work = Some(work);
     let (parameter_expanded_xml, declarations) =
         internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
+    if subset {
+        entity_expansion.charge_parse_work(parameter_expanded_xml.len())?;
+    }
     let expanded_xml = expand_document_entities(
         parameter_expanded_xml.as_ref(),
         &declarations.general,
@@ -1852,6 +2040,7 @@ pub(crate) fn prepare_xml_frontend_bounded(
             Cow::Owned(expanded) => Cow::Owned(expanded),
         });
     };
+    entity_expansion.charge_parse_work(expanded_xml.len())?;
 
     let mut edits = Vec::<(std::ops::Range<usize>, String)>::new();
     let mut scanner = Scanner::new(expanded_xml.as_ref());
@@ -2004,23 +2193,103 @@ fn push_escaped_xml_attribute_value(output: &mut String, value: &str) {
     }
 }
 
-fn normalize_xml_line_endings(value: &str) -> String {
-    if !value.contains('\r') {
-        return value.to_owned();
-    }
-    let mut output = String::with_capacity(value.len());
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\r' {
-            if characters.peek() == Some(&'\n') {
-                characters.next();
-            }
-            output.push('\n');
-        } else {
-            output.push(character);
+/// XML 1.0 section 2.11 normalizes source CR/CRLF before parsing; character
+/// references are processed later and must retain a referenced CR (section 4.5).
+/// <https://www.w3.org/TR/2008/REC-xml-20081126/#sec-line-ends>
+fn append_normalized_xml_line_endings(output: &mut String, mut value: &str) {
+    #[cfg(test)]
+    expansion_workspace_tests::NORMALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + value.len()));
+    while let Some(index) = value.find('\r') {
+        output.push_str(&value[..index]);
+        output.push('\n');
+        value = &value[index + 1..];
+        if value.starts_with('\n') {
+            value = &value[1..];
         }
     }
-    output
+    output.push_str(value);
+}
+
+#[derive(Clone, Copy)]
+enum ParsedText<'a> {
+    Source(&'a str),
+    Reference(char),
+}
+
+impl ParsedText<'_> {
+    fn maximum_bytes(self) -> usize {
+        match self {
+            Self::Source(text) => text.len(),
+            Self::Reference(character) => character.len_utf8(),
+        }
+    }
+    fn append(self, output: &mut String, meter: &mut StreamParseMeter) -> Result<()> {
+        // A source pass and its copy are admitted before either runs.
+        meter
+            .entity_expansion
+            .charge_parse_work(2 * self.maximum_bytes())?;
+        match self {
+            Self::Source(text) => append_normalized_xml_line_endings(output, text),
+            Self::Reference(character) => output.push(character),
+        }
+        Ok(())
+    }
+}
+
+fn reserve_parsed_string(
+    value: &mut String,
+    additional: usize,
+    meter: &mut StreamParseMeter,
+) -> Result<()> {
+    let limit = meter.budget.owned_bytes;
+    let refused = || Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    let required = value.len().checked_add(additional).ok_or_else(refused)?;
+    let old = value.capacity();
+    if required <= old {
+        return Ok(());
+    }
+    // Geometric growth avoids one realloc per character reference. The old
+    // allocation remains admitted until the replacement and copy complete.
+    let target = required.max(2 * old);
+    meter.charge_owned(target)?;
+    meter.entity_expansion.charge_parse_work(value.len())?;
+    value
+        .try_reserve_exact(target - value.len())
+        .map_err(|_| refused())?;
+    meter.charge_owned(value.capacity() - target)?;
+    meter.release_owned(old);
+    Ok(())
+}
+
+fn copy_parsed_text(value: ParsedText<'_>, meter: &mut StreamParseMeter) -> Result<String> {
+    let mut output = String::new();
+    reserve_parsed_string(&mut output, value.maximum_bytes(), meter)?;
+    value.append(&mut output, meter)?;
+    Ok(output)
+}
+
+fn copy_parsed_literal(value: &str, meter: &mut StreamParseMeter) -> Result<String> {
+    let mut output = String::new();
+    reserve_parsed_string(&mut output, value.len(), meter)?;
+    meter.entity_expansion.charge_parse_work(value.len())?;
+    output.push_str(value);
+    Ok(output)
+}
+
+fn copy_base_uri(
+    document: &Document,
+    parent: NodeId,
+    meter: &mut StreamParseMeter,
+) -> Result<Option<String>> {
+    document
+        .node(parent)
+        .and_then(|node| node.base_uri.as_deref())
+        .map(|uri| copy_parsed_literal(uri, meter))
+        .transpose()
 }
 
 fn normalize_xml_attribute_value(value: Cow<'_, str>) -> Cow<'_, str> {
@@ -2044,20 +2313,53 @@ fn normalize_xml_attribute_value(value: Cow<'_, str>) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-struct StreamElementFrame {
+struct StreamElementFrame<'a> {
     node: NodeId,
-    lexical_name: Option<String>,
+    lexical_name: Option<xml_sec_xml_input::lexical::Name<'a>>,
 }
 
-struct StreamParseMeter {
+struct StreamParseMeter<'w> {
     budget: ParseBudget,
     nodes: usize,
     entity_references: usize,
-    entity_expansion: EntityExpansionMeter,
+    entity_expansion: EntityExpansionMeter<'w>,
     namespace_scope_bytes: usize,
+    owned_bytes: usize,
 }
 
-impl StreamParseMeter {
+impl StreamParseMeter<'_> {
+    /// Admit `bytes` more of the tree; namespace scopes share the same ceiling.
+    fn charge_owned(&mut self, bytes: usize) -> Result<()> {
+        let refused = || Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: self.budget.owned_bytes,
+            actual: usize::MAX,
+        };
+        let owned = self.owned_bytes.checked_add(bytes).ok_or_else(refused)?;
+        let actual = owned
+            .checked_add(self.namespace_scope_bytes)
+            .and_then(|actual| actual.checked_add(self.entity_expansion.used))
+            .and_then(|actual| actual.checked_add(self.entity_expansion.declaration_bytes))
+            .ok_or_else(refused)?;
+        ensure(BudgetKind::OwnedBytes, self.budget.owned_bytes, actual)?;
+        self.owned_bytes = owned;
+        Ok(())
+    }
+
+    /// Return `bytes` admitted for storage that was not kept.
+    fn release_owned(&mut self, bytes: usize) {
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_sub(bytes)
+            .expect("released owned bytes were admitted");
+    }
+
+    /// Bytes the tree holds so far.
+    const fn retained_bytes(&self) -> usize {
+        // Both count bytes of live allocations, so their sum fits the address space.
+        self.owned_bytes + self.namespace_scope_bytes
+    }
+
     fn reserve_node(&mut self) -> Result<()> {
         let actual = self.nodes.saturating_add(1);
         ensure(BudgetKind::SourceNodes, self.budget.source_nodes, actual)?;
@@ -2074,16 +2376,201 @@ impl StreamParseMeter {
     }
 }
 
-fn push_stream_element(
+trait ParseAllocationBudget {
+    fn owned_limit(&self) -> usize;
+    fn charge_owned(&mut self, bytes: usize) -> Result<()>;
+    fn release_owned(&mut self, bytes: usize);
+}
+
+impl ParseAllocationBudget for StreamParseMeter<'_> {
+    fn owned_limit(&self) -> usize {
+        self.budget.owned_bytes
+    }
+    fn charge_owned(&mut self, bytes: usize) -> Result<()> {
+        StreamParseMeter::charge_owned(self, bytes)
+    }
+    fn release_owned(&mut self, bytes: usize) {
+        StreamParseMeter::release_owned(self, bytes);
+    }
+}
+
+trait ParseIndex {
+    fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn entry_bytes(&self) -> usize;
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError>;
+}
+
+impl<K: Eq + std::hash::Hash, V> ParseIndex for HashMap<K, V> {
+    fn len(&self) -> usize {
+        HashMap::len(self)
+    }
+    fn capacity(&self) -> usize {
+        HashMap::capacity(self)
+    }
+    fn entry_bytes(&self) -> usize {
+        std::mem::size_of::<(K, V)>() + std::mem::size_of::<u64>()
+    }
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        HashMap::try_reserve(self, additional)
+    }
+}
+
+impl<K: Eq + std::hash::Hash> ParseIndex for HashSet<K> {
+    fn len(&self) -> usize {
+        HashSet::len(self)
+    }
+    fn capacity(&self) -> usize {
+        HashSet::capacity(self)
+    }
+    fn entry_bytes(&self) -> usize {
+        std::mem::size_of::<K>() + std::mem::size_of::<u64>()
+    }
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        HashSet::try_reserve(self, additional)
+    }
+}
+
+/// Append a parsed node whose owned payload was admitted before construction.
+///
+/// The arena and the parent's child list grow by explicit exact reservations,
+/// so their capacity is admitted before it is allocated.
+fn push_metered(
     document: &mut Document,
-    elements: &mut Vec<StreamElementFrame>,
-    start: &xml_sec_xml_input::lexical::StartTag<'_>,
+    parent: NodeId,
+    kind: NodeKind,
+    base_uri: Option<String>,
+    meter: &mut StreamParseMeter,
+) -> Result<NodeId> {
+    reserve_node_storage(document, parent, meter)?;
+    Ok(document.push(parent, kind, base_uri))
+}
+
+fn reserve_node_storage(
+    document: &mut Document,
+    parent: NodeId,
+    meter: &mut StreamParseMeter,
+) -> Result<()> {
+    let nodes = &mut document.nodes;
+    if nodes.len() == nodes.capacity() {
+        let additional = nodes.capacity().max(4);
+        reserve_charged(nodes, additional, meter)?;
+    }
+    let children = &mut nodes[parent.0].children;
+    if children.len() == children.capacity() {
+        let additional = children.capacity().max(4);
+        reserve_charged(children, additional, meter)?;
+    }
+    Ok(())
+}
+
+/// Admit one more entry of a retained index whose strings own `owned_bytes`, growing the
+/// index first when it is full. Storage is counted as `estimated_owned_bytes` counts it.
+fn reserve_index_entry(
+    index: &mut impl ParseIndex,
+    owned_bytes: usize,
+    meter: &mut impl ParseAllocationBudget,
+) -> Result<()> {
+    let limit = meter.owned_limit();
+    let refused = || Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    if index.len() == index.capacity() {
+        let entry = index.entry_bytes();
+        let additional = index.capacity().max(4);
+        // A hash table reports a capacity of at least the entries it reserves and at
+        // most twice as many, so this bounds the growth before it is allocated.
+        let bound = additional
+            .checked_mul(2)
+            .and_then(|slots| slots.checked_mul(entry))
+            .ok_or_else(refused)?;
+        meter.charge_owned(bound)?;
+        let before = index.capacity();
+        index.try_reserve(additional).map_err(|_| refused())?;
+        let granted = (index.capacity() - before)
+            .checked_mul(entry)
+            .ok_or_else(refused)?;
+        if granted > bound {
+            meter.charge_owned(granted - bound)?;
+        } else {
+            meter.release_owned(bound - granted);
+        }
+    }
+    meter.charge_owned(owned_bytes)
+}
+
+/// Grow `values` by `additional` slots, charging the requested capacity before
+/// allocating and any further capacity the allocator granted after it.
+fn reserve_charged<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    meter: &mut impl ParseAllocationBudget,
+) -> Result<()> {
+    let limit = meter.owned_limit();
+    let refused = || Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    let old_bytes = values.capacity() * std::mem::size_of::<T>();
+    let requested = values
+        .len()
+        .checked_add(additional)
+        .ok_or_else(refused)?
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(refused)?;
+    // A reallocating vector can hold both blocks until the copy completes.
+    meter.charge_owned(requested)?;
+    let before = values.capacity();
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| refused())?;
+    // `try_reserve_exact` may allocate more than requested; capacity never shrinks here.
+    let granted = values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(refused)?;
+    if granted > requested {
+        meter.charge_owned(granted - requested)?;
+    } else {
+        meter.release_owned(requested - granted);
+    }
+    debug_assert!(values.capacity() >= before);
+    meter.release_owned(old_bytes);
+    Ok(())
+}
+
+fn push_stream_element<
+    'a,
+    A: std::ops::Deref<Target = [xml_sec_xml_input::lexical::Attribute<'a>]>,
+>(
+    document: &mut Document,
+    elements: &mut Vec<StreamElementFrame<'a>>,
+    start: &xml_sec_xml_input::lexical::StartTag<'a, A>,
     empty: bool,
     declarations: &InternalEntityDeclarations,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
     meter.element_depth(elements.len())?;
     meter.reserve_node()?;
+    // Frames survive semantic staging and borrow QName slices from the input.
+    // Admit replacement capacity while the old stack is still live.
+    if !empty && elements.len() == elements.capacity() {
+        let additional = elements.capacity().max(4);
+        reserve_charged(elements, additional, meter)?;
+    }
+    let staging_start = meter.owned_bytes;
     let parent = elements
         .last()
         .map(|frame| frame.node)
@@ -2103,14 +2590,20 @@ fn push_stream_element(
             .namespace_scope_bytes
             .saturating_add(namespace_index_bytes),
     )?;
+    meter.charge_owned(namespace_index_bytes)?;
     let mut namespace_index = namespace_index(&namespaces);
+    meter
+        .charge_owned(start.name.local().len() + start.name.prefix().map_or(0, |p| p.len() + 1))?;
     let lexical_name = start.name.qualified();
     let declared_attributes = declarations
         .attributes
         .get(lexical_name.as_ref())
         .map_or(&[][..], Vec::as_slice);
     let mut raw_attributes = Vec::new();
-    for attribute in &start.attributes {
+    for attribute in start.attributes.iter() {
+        meter.charge_owned(
+            attribute.name.local().len() + attribute.name.prefix().map_or(0, |p| p.len() + 1),
+        )?;
         let name = attribute.name.qualified();
         let attribute_type = declared_attributes
             .iter()
@@ -2118,13 +2611,12 @@ fn push_stream_element(
             .map_or(InternalAttributeType::Cdata, |declaration| {
                 declaration.attribute_type
             });
-        let value = prepare_attribute_value(
+        let value = prepare_stream_attribute_value(
             name.as_ref(),
             attribute.value,
             &declarations.general,
             attribute_type.is_cdata(),
-            &mut meter.entity_references,
-            &mut meter.entity_expansion,
+            meter,
         )?;
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
@@ -2138,7 +2630,7 @@ fn push_stream_element(
                 &mut meter.namespace_scope_bytes,
             )?;
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
-            if !crate::lexical::is_ncname(prefix) {
+            if !super::lexical::is_ncname(prefix) {
                 return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
             }
             validate_namespace_binding(Some(prefix), &value)?;
@@ -2152,6 +2644,10 @@ fn push_stream_element(
                 &mut meter.namespace_scope_bytes,
             )?;
         } else {
+            if raw_attributes.len() == raw_attributes.capacity() {
+                let additional = raw_attributes.capacity().max(4);
+                reserve_charged(&mut raw_attributes, additional, meter)?;
+            }
             raw_attributes.push((name.into_owned(), value, attribute_type));
         }
     }
@@ -2166,13 +2662,13 @@ fn push_stream_element(
         {
             continue;
         }
-        let value = prepare_attribute_value(
+        meter.charge_owned(declaration.name.len())?;
+        let value = prepare_stream_attribute_value(
             &declaration.name,
             default,
             &declarations.general,
             declaration.attribute_type.is_cdata(),
-            &mut meter.entity_references,
-            &mut meter.entity_expansion,
+            meter,
         )?;
         if declaration.name == "xmlns" {
             validate_namespace_binding(None, &value)?;
@@ -2197,78 +2693,124 @@ fn push_stream_element(
                 &mut meter.namespace_scope_bytes,
             )?;
         } else {
+            if raw_attributes.len() == raw_attributes.capacity() {
+                let additional = raw_attributes.capacity().max(4);
+                reserve_charged(&mut raw_attributes, additional, meter)?;
+            }
             raw_attributes.push((declaration.name.clone(), value, declaration.attribute_type));
         }
     }
+    meter.charge_owned(lexical_name.len())?;
     let prefix = start.name.prefix().map(str::to_owned);
     let local = start.name.local().to_owned();
+    if let Some(position) = namespace_index.get(prefix.as_deref().unwrap_or_default()) {
+        meter.charge_owned(namespaces[*position].uri.len())?;
+    }
     let namespace = namespace_for(&namespaces, &namespace_index, prefix.as_deref());
     if prefix.is_some() && namespace.is_none() {
         return Err(Error::Xml(format!(
             "undeclared namespace prefix in element {lexical_name}"
         )));
     }
+    drop(lexical_name);
     let mut first_id_attribute = None;
     let mut additional_id_attributes = Vec::new();
-    let attributes = raw_attributes
-        .into_iter()
-        .enumerate()
-        .map(|(index, (lexical, value, attribute_type))| {
-            let (prefix, local) = split_lexical_name(&lexical)?;
-            let namespace = prefix
-                .as_deref()
-                .and_then(|prefix| namespace_for(&namespaces, &namespace_index, Some(prefix)));
-            if prefix.is_some() && namespace.is_none() {
-                return Err(Error::Xml(format!(
-                    "undeclared namespace prefix in attribute {lexical}"
-                )));
-            }
-            if attribute_type.is_id() {
-                if first_id_attribute.is_none() {
-                    first_id_attribute = Some(index);
-                } else {
-                    additional_id_attributes.push(index);
+    let mut attributes = Vec::new();
+    reserve_charged(&mut attributes, raw_attributes.len(), meter)?;
+    for (index, (lexical, value, attribute_type)) in raw_attributes.into_iter().enumerate() {
+        meter.charge_owned(lexical.len())?;
+        let (prefix, local) = split_lexical_name(&lexical)?;
+        if let Some(position) = prefix
+            .as_deref()
+            .and_then(|prefix| namespace_index.get(prefix))
+        {
+            meter.charge_owned(namespaces[*position].uri.len())?;
+        }
+        let namespace = prefix
+            .as_deref()
+            .and_then(|prefix| namespace_for(&namespaces, &namespace_index, Some(prefix)));
+        if prefix.is_some() && namespace.is_none() {
+            return Err(Error::Xml(format!(
+                "undeclared namespace prefix in attribute {lexical}"
+            )));
+        }
+        if attribute_type.is_id() {
+            if first_id_attribute.is_none() {
+                first_id_attribute = Some(index);
+            } else {
+                if additional_id_attributes.len() == additional_id_attributes.capacity() {
+                    let additional = additional_id_attributes.capacity().max(4);
+                    reserve_charged(&mut additional_id_attributes, additional, meter)?;
                 }
+                additional_id_attributes.push(index);
             }
-            Ok(Attribute {
-                name: ExpandedName::new(namespace, local),
-                prefix,
-                value,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut expanded_names = HashSet::with_capacity(attributes.len());
-    if let Some(duplicate) = attributes
-        .iter()
-        .find(|attribute| !expanded_names.insert(attribute.name.clone()))
-    {
-        return Err(Error::Xml(format!(
-            "duplicate expanded attribute {{{}}}{}",
-            duplicate.name.namespace.as_deref().unwrap_or(""),
-            duplicate.name.local
-        )));
+        }
+        attributes.push(Attribute {
+            name: ExpandedName::new(namespace, local),
+            prefix,
+            value,
+        });
     }
-    let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
+    // Borrow names instead of cloning every namespace/local string into the
+    // duplicate detector. Admit its bucket bound before allocating it.
+    if attributes.len() > 1 {
+        let duplicate_bytes = attributes
+            .len()
+            .max(4)
+            .checked_mul(2)
+            .and_then(|slots| {
+                slots.checked_mul(std::mem::size_of::<&ExpandedName>() + std::mem::size_of::<u64>())
+            })
+            .ok_or(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: meter.budget.owned_bytes,
+                actual: usize::MAX,
+            })?;
+        meter.charge_owned(duplicate_bytes)?;
+        let mut expanded_names = HashSet::with_capacity(attributes.len());
+        if let Some(duplicate) = attributes
+            .iter()
+            .find(|attribute| !expanded_names.insert(&attribute.name))
+        {
+            return Err(Error::Xml(format!(
+                "duplicate expanded attribute {{{}}}{}",
+                duplicate.name.namespace.as_deref().unwrap_or(""),
+                duplicate.name.local
+            )));
+        }
+        drop(expanded_names);
+        meter.release_owned(duplicate_bytes);
+    }
+    let inherited_base = copy_base_uri(document, parent, meter)?;
     let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
         attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
     }) {
-        Some(crate::resolver::resolve_uri_reference(
+        Some(super::resolver::resolve_uri_reference(
             inherited_base.as_deref(),
             &attribute.value,
         )?)
     } else {
         inherited_base
     };
-    let projected = document.push(
-        parent,
-        NodeKind::Element {
-            name: ExpandedName::new(namespace, local),
-            prefix,
-            attributes,
-            namespaces,
-        },
-        effective_base,
-    );
+    drop(namespace_index);
+    // Keep the admitted payload live while growing the node arena and parent's
+    // child vector. Only dropped staging is released, never the moved strings.
+    let id_bytes = additional_id_attributes.capacity() * std::mem::size_of::<usize>();
+    let kind = NodeKind::Element {
+        name: ExpandedName::new(namespace, local),
+        prefix,
+        attributes,
+        namespaces,
+    };
+    let payload = node_payload_bytes(&kind, effective_base.as_deref());
+    let staged = meter.owned_bytes - staging_start - id_bytes;
+    if staged >= payload {
+        meter.release_owned(staged - payload);
+    } else {
+        meter.charge_owned(payload - staged)?;
+    }
+    reserve_node_storage(document, parent, meter)?;
+    let projected = document.push(parent, kind, effective_base);
     for index in first_id_attribute
         .into_iter()
         .chain(additional_id_attributes)
@@ -2281,12 +2823,20 @@ fn push_stream_element(
             })
             .map(|attribute| collapse_xml_whitespace(&attribute.value).into_owned())
             .ok_or_else(|| Error::Xml("DTD ID attribute reference is stale".into()))?;
+        let key_bytes = value.capacity();
+        reserve_index_entry(&mut document.ids, key_bytes, meter)?;
+        let indexed = document.ids.len();
         document.register_dtd_id_value(projected, value)?;
+        if document.ids.len() == indexed {
+            // A repeated ID keeps its first owner; this key was dropped.
+            meter.release_owned(key_bytes);
+        }
     }
+    meter.release_owned(id_bytes);
     if !empty {
         elements.push(StreamElementFrame {
             node: projected,
-            lexical_name: Some(lexical_name.into_owned()),
+            lexical_name: Some(start.name),
         });
     }
     Ok(projected)
@@ -2301,6 +2851,44 @@ fn prepare_attribute_value(
     entity_expansion: &mut EntityExpansionMeter,
 ) -> Result<String> {
     let value = expand_entity_references(raw, entities, 0, entity_references, entity_expansion)?;
+    finish_attribute_value(name, value, is_cdata)
+}
+
+fn prepare_stream_attribute_value(
+    name: &str,
+    raw: &str,
+    entities: &HashMap<String, String>,
+    is_cdata: bool,
+    meter: &mut StreamParseMeter,
+) -> Result<String> {
+    // Entity expansion and attribute staging coexist with the retained tree.
+    // Bound expansion by that remaining space, then admit normalization,
+    // reference decoding and tokenized collapse before any of them allocate.
+    let workspace = meter.entity_expansion.workspace;
+    meter.entity_expansion.workspace = meter
+        .budget
+        .owned_bytes
+        .saturating_sub(meter.owned_bytes)
+        .saturating_sub(meter.namespace_scope_bytes);
+    let expanded = expand_entity_references(
+        raw,
+        entities,
+        0,
+        &mut meter.entity_references,
+        &mut meter.entity_expansion,
+    );
+    meter.entity_expansion.workspace = workspace;
+    let expanded = expanded?;
+    let staging = expanded.len().checked_mul(3).ok_or(Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit: meter.budget.owned_bytes,
+        actual: usize::MAX,
+    })?;
+    meter.charge_owned(staging)?;
+    finish_attribute_value(name, expanded, is_cdata)
+}
+
+fn finish_attribute_value(name: &str, value: Cow<'_, str>, is_cdata: bool) -> Result<String> {
     if value.contains('<') {
         return Err(Error::Xml(format!(
             "attribute `{name}` entity replacement contains a literal `<`"
@@ -2316,7 +2904,7 @@ fn prepare_attribute_value(
     })
 }
 
-fn event_range_start(event: &xml_sec_xml_input::lexical::Event<'_>) -> usize {
+fn event_range_start<A>(event: &xml_sec_xml_input::lexical::Event<'_, A>) -> usize {
     use xml_sec_xml_input::lexical::Event;
     match event {
         Event::Declaration { range, .. }
@@ -2375,7 +2963,7 @@ fn xml_line_starts(xml: &str) -> Vec<usize> {
 
 fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
     let mut parts = value
-        .split(crate::lexical::is_xml_whitespace)
+        .split(super::lexical::is_xml_whitespace)
         .filter(|part| !part.is_empty());
     let Some(first) = parts.next() else {
         return Cow::Owned(String::new());
@@ -2394,8 +2982,8 @@ fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
 
 fn push_parsed_text(
     document: &mut Document,
-    elements: &[StreamElementFrame],
-    value: String,
+    elements: &[StreamElementFrame<'_>],
+    value: ParsedText<'_>,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
     let parent = elements
@@ -2411,27 +2999,31 @@ fn push_parsed_text(
             disable_output_escaping: false,
         } = &mut document.nodes[last_child.0].kind
     {
-        existing.push_str(&value);
+        reserve_parsed_string(existing, value.maximum_bytes(), meter)?;
+        value.append(existing, meter)?;
         return Ok(last_child);
     }
     meter.reserve_node()?;
-    let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
-    Ok(document.push(
+    let value = copy_parsed_text(value, meter)?;
+    let inherited_base = copy_base_uri(document, parent, meter)?;
+    push_metered(
+        document,
         parent,
         NodeKind::Text {
             value,
             disable_output_escaping: false,
         },
         inherited_base,
-    ))
+        meter,
+    )
 }
 
 fn split_lexical_name(name: &str) -> Result<(Option<String>, String)> {
     let (prefix, local) = name
         .split_once(':')
         .map_or((None, name), |(prefix, local)| (Some(prefix), local));
-    if !crate::lexical::is_ncname(local)
-        || prefix.is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+    if !super::lexical::is_ncname(local)
+        || prefix.is_some_and(|prefix| !super::lexical::is_ncname(prefix))
         || local.contains(':')
     {
         return Err(Error::Xml(format!("invalid XML QName {name}")));
@@ -2570,6 +3162,9 @@ fn internal_general_entities<'a>(
         match next {
             Cow::Borrowed(_) => break declarations,
             Cow::Owned(next) => {
+                let held = declarations.owned_bytes;
+                drop(declarations);
+                meter.release_declarations(held);
                 changed = true;
                 rounds += 1;
                 meter.check_depth(rounds)?;
@@ -2799,6 +3394,7 @@ fn parsed_external_reachability<'a>(
 
 #[derive(Default)]
 struct InternalEntityDeclarations {
+    owned_bytes: usize,
     general: HashMap<String, String>,
     parameter: HashMap<String, String>,
     parameter_spans: Vec<(usize, usize)>,
@@ -2812,6 +3408,38 @@ struct InternalAttributeDeclaration {
     name: String,
     attribute_type: InternalAttributeType,
     default: Option<String>,
+}
+
+// Declaration storage is live until expansion and default-attribute processing
+// finish. It shares the parser's workspace, but is not entity expansion output.
+struct DeclarationAllocation<'a, 'w> {
+    expansion: &'a mut EntityExpansionMeter<'w>,
+    owned: &'a mut usize,
+}
+
+impl ParseAllocationBudget for DeclarationAllocation<'_, '_> {
+    fn owned_limit(&self) -> usize {
+        self.expansion.workspace_maximum
+    }
+    fn charge_owned(&mut self, bytes: usize) -> Result<()> {
+        self.expansion.check_workspace(bytes)?;
+        self.expansion.charge_parse_work(bytes)?;
+        self.expansion.declaration_bytes += bytes;
+        *self.owned += bytes;
+        Ok(())
+    }
+    fn release_owned(&mut self, bytes: usize) {
+        self.expansion.release_declarations(bytes);
+        *self.owned = self
+            .owned
+            .checked_sub(bytes)
+            .expect("admitted declaration storage");
+    }
+}
+
+fn declaration_string(value: &str, budget: &mut impl ParseAllocationBudget) -> Result<String> {
+    budget.charge_owned(value.len())?;
+    Ok(value.to_owned())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2833,7 +3461,7 @@ impl InternalAttributeType {
 
 fn collect_internal_entity_declarations(
     subset: &str,
-    meter: &EntityExpansionMeter,
+    meter: &mut EntityExpansionMeter,
 ) -> Result<InternalEntityDeclarations> {
     let mut declarations = InternalEntityDeclarations::default();
     let mut cursor = 0;
@@ -2841,7 +3469,7 @@ fn collect_internal_entity_declarations(
         if subset[cursor..]
             .chars()
             .next()
-            .is_some_and(crate::lexical::is_xml_whitespace)
+            .is_some_and(super::lexical::is_xml_whitespace)
         {
             skip_xml_whitespace(subset, &mut cursor);
             continue;
@@ -2866,7 +3494,7 @@ fn collect_internal_entity_declarations(
             continue;
         }
         if subset[cursor..].starts_with("<!ATTLIST") {
-            cursor = collect_internal_attribute_list(subset, cursor, &mut declarations.attributes)?;
+            cursor = collect_internal_attribute_list(subset, cursor, &mut declarations, meter)?;
             continue;
         }
         if subset[cursor..].starts_with("<!ELEMENT") {
@@ -2922,13 +3550,25 @@ fn collect_internal_entity_declarations(
         if !matches!(quote, b'\'' | b'"') {
             let (end, system_identifier) =
                 parse_external_entity_declaration(subset, cursor, parameter)?;
-            if !parameter && declarations.declared_general.insert(name.to_owned()) {
+            if !parameter && !declarations.declared_general.contains(name) {
+                let mut allocation = DeclarationAllocation {
+                    expansion: meter,
+                    owned: &mut declarations.owned_bytes,
+                };
+                reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
+                declarations
+                    .declared_general
+                    .insert(declaration_string(name, &mut allocation)?);
                 if let Some(system_identifier) = system_identifier {
-                    declarations
-                        .unparsed
-                        .insert(name.to_owned(), system_identifier.to_owned());
+                    reserve_index_entry(&mut declarations.unparsed, 0, &mut allocation)?;
+                    let name = declaration_string(name, &mut allocation)?;
+                    let identifier = declaration_string(system_identifier, &mut allocation)?;
+                    declarations.unparsed.insert(name, identifier);
                 } else {
-                    declarations.parsed_external.insert(name.to_owned());
+                    reserve_index_entry(&mut declarations.parsed_external, 0, &mut allocation)?;
+                    declarations
+                        .parsed_external
+                        .insert(declaration_string(name, &mut allocation)?);
                 }
             }
             cursor = end;
@@ -2948,9 +3588,9 @@ fn collect_internal_entity_declarations(
                 "unterminated value for internal entity `{name}`"
             )));
         }
-        let mut value = subset[value_start..cursor].to_owned();
+        let raw_value = &subset[value_start..cursor];
         cursor += 1;
-        validate_entity_value(name, &value, parameter)?;
+        validate_entity_value(name, raw_value, parameter)?;
         // XML 1.0 Fifth Edition section 4.2, [70]-[74], permits only XML S before `>`
         // after an internal EntityValue, for both general and parameter entities.
         // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
@@ -2961,34 +3601,83 @@ fn collect_internal_entity_declarations(
             )));
         }
         cursor += 1;
+        let mut allocation = DeclarationAllocation {
+            expansion: meter,
+            owned: &mut declarations.owned_bytes,
+        };
         if parameter {
+            if declarations.parameter_spans.len() == declarations.parameter_spans.capacity() {
+                let additional = declarations.parameter_spans.capacity().max(4);
+                reserve_charged(
+                    &mut declarations.parameter_spans,
+                    additional,
+                    &mut allocation,
+                )?;
+            }
             declarations
                 .parameter_spans
                 .push((declaration_start, cursor));
         }
+        let duplicate = if parameter {
+            declarations.parameter.contains_key(name)
+        } else {
+            declarations.declared_general.contains(name)
+        };
+        let predefined = !parameter && matches!(name, "amp" | "apos" | "gt" | "lt" | "quot");
+        if duplicate && !predefined {
+            continue;
+        }
+        let value;
         if !parameter {
-            if matches!(name, "amp" | "apos" | "gt" | "lt" | "quot") {
-                value = normalize_predefined_entity_declaration(name, value)?;
+            if predefined {
+                let scratch = raw_value.len().checked_mul(2).ok_or(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit: allocation.owned_limit(),
+                    actual: usize::MAX,
+                })?;
+                allocation.charge_owned(scratch)?;
+                value = normalize_predefined_entity_declaration(name, raw_value)?;
+                allocation.release_owned(scratch - value.capacity());
             } else {
                 // XML 1.0 section 4.5 constructs replacement text by expanding character
                 // references, but leaves general references for their eventual context.
                 // https://www.w3.org/TR/xml/#intern-replacement
-                if let Cow::Owned(replacement) =
-                    decode_parameter_character_references(&value, meter)?
-                {
-                    value = replacement;
-                }
+                value = match decode_parameter_character_references_in(raw_value, |bytes| {
+                    allocation.expansion.check(bytes)?;
+                    allocation.charge_owned(bytes)
+                })? {
+                    Cow::Owned(value) => value,
+                    Cow::Borrowed(value) => declaration_string(value, &mut allocation)?,
+                };
             }
+        } else {
+            value = declaration_string(raw_value, &mut allocation)?;
+        }
+        if duplicate {
+            let capacity = value.capacity();
+            drop(value);
+            allocation.release_owned(capacity);
+            continue;
         }
         if parameter {
+            reserve_index_entry(&mut declarations.parameter, 0, &mut allocation)?;
             declarations
                 .parameter
-                .entry(name.to_owned())
+                .entry(declaration_string(name, &mut allocation)?)
                 .or_insert(value);
-        } else if declarations.declared_general.insert(name.to_owned()) {
-            declarations.general.insert(name.to_owned(), value);
+        } else {
+            reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
+            declarations
+                .declared_general
+                .insert(declaration_string(name, &mut allocation)?);
+            reserve_index_entry(&mut declarations.general, 0, &mut allocation)?;
+            declarations
+                .general
+                .insert(declaration_string(name, &mut allocation)?, value);
         }
     }
+    #[cfg(test)]
+    expansion_workspace_tests::observe_declarations(&declarations);
     Ok(declarations)
 }
 
@@ -3062,7 +3751,7 @@ fn dtd_keyword_at(subset: &str, cursor: usize, keyword: &str) -> bool {
             .chars()
             .next()
             .is_none_or(|character| {
-                crate::lexical::is_xml_whitespace(character) || character == '>'
+                super::lexical::is_xml_whitespace(character) || character == '>'
             })
 }
 
@@ -3289,11 +3978,12 @@ fn parse_dtd_public_identifier(subset: &str, cursor: &mut usize, context: &str) 
 fn collect_internal_attribute_list(
     subset: &str,
     mut cursor: usize,
-    declarations: &mut HashMap<String, Vec<InternalAttributeDeclaration>>,
+    declarations: &mut InternalEntityDeclarations,
+    meter: &mut EntityExpansionMeter,
 ) -> Result<usize> {
     cursor += "<!ATTLIST".len();
     require_dtd_whitespace(subset, &mut cursor, "after <!ATTLIST")?;
-    let element_name = parse_dtd_name(subset, &mut cursor, "ATTLIST element")?.to_owned();
+    let element_name = parse_dtd_name(subset, &mut cursor, "ATTLIST element")?;
     loop {
         let spacing_start = cursor;
         skip_xml_whitespace(subset, &mut cursor);
@@ -3305,16 +3995,36 @@ fn collect_internal_attribute_list(
                 "XML whitespace is required before an ATTLIST attribute".into(),
             ));
         }
-        let name = parse_dtd_name(subset, &mut cursor, "ATTLIST attribute")?.to_owned();
+        let name = parse_dtd_name(subset, &mut cursor, "ATTLIST attribute")?;
         require_dtd_whitespace(subset, &mut cursor, "after ATTLIST attribute name")?;
         let attribute_type = parse_dtd_attribute_type(subset, &mut cursor)?;
         require_dtd_whitespace(subset, &mut cursor, "before ATTLIST default declaration")?;
         let default = parse_dtd_attribute_default(subset, &mut cursor)?;
-        let element_declarations = declarations.entry(element_name.clone()).or_default();
+        let mut allocation = DeclarationAllocation {
+            expansion: meter,
+            owned: &mut declarations.owned_bytes,
+        };
+        if !declarations.attributes.contains_key(element_name) {
+            reserve_index_entry(&mut declarations.attributes, 0, &mut allocation)?;
+            let key = declaration_string(element_name, &mut allocation)?;
+            declarations.attributes.insert(key, Vec::new());
+        }
+        let element_declarations = declarations
+            .attributes
+            .get_mut(element_name)
+            .expect("inserted declaration group");
         if !element_declarations
             .iter()
             .any(|declaration| declaration.name == name)
         {
+            if element_declarations.len() == element_declarations.capacity() {
+                let additional = element_declarations.capacity().max(4);
+                reserve_charged(element_declarations, additional, &mut allocation)?;
+            }
+            let name = declaration_string(name, &mut allocation)?;
+            let default = default
+                .map(|value| declaration_string(value, &mut allocation))
+                .transpose()?;
             element_declarations.push(InternalAttributeDeclaration {
                 name,
                 attribute_type,
@@ -3329,7 +4039,7 @@ fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<Internal
         && subset[*cursor + "NOTATION".len()..]
             .chars()
             .next()
-            .is_some_and(crate::lexical::is_xml_whitespace)
+            .is_some_and(super::lexical::is_xml_whitespace)
     {
         *cursor += "NOTATION".len();
         require_dtd_whitespace(subset, cursor, "after NOTATION")?;
@@ -3401,7 +4111,7 @@ fn parse_dtd_enumeration(
 fn parse_dtd_nmtoken(subset: &str, cursor: &mut usize) -> Result<()> {
     let start = *cursor;
     while let Some(character) = subset[*cursor..].chars().next()
-        && (character == ':' || crate::lexical::is_ncname_char(character))
+        && (character == ':' || super::lexical::is_ncname_char(character))
     {
         *cursor += character.len_utf8();
     }
@@ -3414,7 +4124,7 @@ fn parse_dtd_nmtoken(subset: &str, cursor: &mut usize) -> Result<()> {
     }
 }
 
-fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Option<String>> {
+fn parse_dtd_attribute_default<'a>(subset: &'a str, cursor: &mut usize) -> Result<Option<&'a str>> {
     if subset[*cursor..].starts_with("#REQUIRED") {
         *cursor += "#REQUIRED".len();
         return Ok(None);
@@ -3434,7 +4144,7 @@ fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Optio
         ));
     }
     validate_attribute_value_references(value)?;
-    Ok(Some(value.to_owned()))
+    Ok(Some(value))
 }
 
 fn validate_attribute_value_references(value: &str) -> Result<()> {
@@ -3454,7 +4164,7 @@ fn validate_attribute_value_references(value: &str) -> Result<()> {
         let valid = if let Some(reference) = reference.strip_prefix('#') {
             valid_xml_character_reference(reference)
         } else {
-            crate::lexical::is_xml_name(reference)
+            super::lexical::is_xml_name(reference)
         };
         if !valid {
             return Err(Error::Xml(
@@ -3535,12 +4245,12 @@ fn parse_dtd_system_literal<'a>(
 fn parse_dtd_name<'a>(subset: &'a str, cursor: &mut usize, context: &str) -> Result<&'a str> {
     let start = *cursor;
     while let Some(character) = subset[*cursor..].chars().next()
-        && (character == ':' || crate::lexical::is_ncname_char(character))
+        && (character == ':' || super::lexical::is_ncname_char(character))
     {
         *cursor += character.len_utf8();
     }
     let name = &subset[start..*cursor];
-    if crate::lexical::is_xml_name(name) {
+    if super::lexical::is_xml_name(name) {
         Ok(name)
     } else {
         Err(Error::Xml(format!("{context} has an invalid XML Name")))
@@ -3603,7 +4313,7 @@ fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()>
             .chars()
             .next()
             .expect("cursor is before the end of the entity value");
-        if !crate::lexical::is_xml10_character(character) {
+        if !super::lexical::is_xml10_character(character) {
             return Err(Error::Xml(format!(
                 "{declaration_kind} entity declaration `{name}` has an invalid EntityValue"
             )));
@@ -3619,11 +4329,11 @@ fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()>
                 })?;
             let reference = &value[cursor + 1..end];
             let valid = if character == '%' {
-                crate::lexical::is_xml_name(reference)
+                super::lexical::is_xml_name(reference)
             } else if let Some(reference) = reference.strip_prefix('#') {
                 valid_xml_character_reference(reference)
             } else {
-                crate::lexical::is_xml_name(reference)
+                super::lexical::is_xml_name(reference)
             };
             if !valid {
                 return Err(Error::Xml(format!(
@@ -3642,16 +4352,16 @@ fn valid_xml_character_reference(reference: &str) -> bool {
     xml_sec_xml_input::lexical::decode_numeric_character_reference(reference).is_ok()
 }
 
-fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<String> {
+fn normalize_predefined_entity_declaration(name: &str, value: &str) -> Result<String> {
     let (expected, required_replacement) = match name {
         "amp" => ('&', Some("&#38;")),
         "apos" => ('\'', None),
         "gt" => ('>', None),
         "lt" => ('<', Some("&#60;")),
         "quot" => ('"', None),
-        _ => return Ok(value),
+        _ => return Ok(value.to_owned()),
     };
-    let first = xml_sec_xml_input::lexical::decode_references(&value)
+    let first = xml_sec_xml_input::lexical::decode_references(value)
         .map_err(|error| Error::Xml(error.to_string()))?;
     if required_replacement.is_some_and(|required| first.as_ref() != required) {
         return Err(Error::Xml(format!(
@@ -3745,7 +4455,7 @@ fn expand_parameter_entity_references_into<'entities>(
             if after_percent
                 .chars()
                 .next()
-                .is_some_and(crate::lexical::is_xml_whitespace)
+                .is_some_and(super::lexical::is_xml_whitespace)
             {
                 // In PEDecl, `%` followed by XML S marks a parameter-entity declaration rather
                 // than a PEReference. XML 1.0 production [72]: https://www.w3.org/TR/xml/#NT-PEDecl
@@ -3762,7 +4472,7 @@ fn expand_parameter_entity_references_into<'entities>(
                 .position(|byte| *byte == b';')
                 .ok_or_else(|| Error::Xml("unterminated parameter entity reference".into()))?;
             let name = &after_percent[..end];
-            if !crate::lexical::is_xml_name(name) {
+            if !super::lexical::is_xml_name(name) {
                 return Err(Error::Xml("invalid parameter entity reference name".into()));
             }
             if let Some((entity_name, replacement)) = context.entities.get_key_value(name) {
@@ -3822,10 +4532,17 @@ fn decode_parameter_character_references<'a>(
     value: &'a str,
     meter: &EntityExpansionMeter,
 ) -> Result<Cow<'a, str>> {
+    decode_parameter_character_references_in(value, |bytes| meter.check(bytes))
+}
+
+fn decode_parameter_character_references_in(
+    value: &str,
+    admit: impl FnOnce(usize) -> Result<()>,
+) -> Result<Cow<'_, str>> {
     if !value.as_bytes().windows(2).any(|bytes| bytes == b"&#") {
         return Ok(Cow::Borrowed(value));
     }
-    meter.check(value.len())?;
+    admit(value.len())?;
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0usize;
     while let Some(relative) = value[cursor..].find("&#") {
@@ -3946,7 +4663,7 @@ fn scan_doctype_end(doctype: &str) -> Result<(usize, Option<(usize, usize)>)> {
 
 fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
     while let Some(character) = value[*cursor..].chars().next()
-        && crate::lexical::is_xml_whitespace(character)
+        && super::lexical::is_xml_whitespace(character)
     {
         *cursor += character.len_utf8();
     }
@@ -4229,15 +4946,19 @@ fn expand_entity_references_into<'entities>(
     Ok(())
 }
 
-struct EntityExpansionMeter {
+struct EntityExpansionMeter<'w> {
     kind: BudgetKind,
     limit: usize,
     used: usize,
     reference_limit: usize,
     depth_limit: usize,
+    workspace: usize,
+    workspace_maximum: usize,
+    declaration_bytes: usize,
+    parse_work: Option<&'w mut ParseWork>,
 }
 
-impl EntityExpansionMeter {
+impl EntityExpansionMeter<'_> {
     #[cfg(test)]
     const fn new(limit: usize) -> Self {
         Self::with_reference_limit(limit, usize::MAX)
@@ -4254,7 +4975,7 @@ impl EntityExpansionMeter {
     }
 
     const fn with_parse_budget(budget: ParseBudget) -> Self {
-        Self::with_limits(
+        let mut meter = Self::with_limits(
             BudgetKind::EntityExpansionBytes,
             if budget.entity_expansion_bytes < ENTITY_EXPANSION_BYTE_CEILING {
                 budget.entity_expansion_bytes
@@ -4267,7 +4988,10 @@ impl EntityExpansionMeter {
             } else {
                 ENTITY_EXPANSION_DEPTH_CEILING
             },
-        )
+        );
+        meter.workspace = budget.owned_bytes;
+        meter.workspace_maximum = budget.owned_bytes;
+        meter
     }
 
     const fn with_limits(
@@ -4282,6 +5006,10 @@ impl EntityExpansionMeter {
             used: 0,
             reference_limit,
             depth_limit,
+            workspace: usize::MAX,
+            workspace_maximum: usize::MAX,
+            declaration_bytes: 0,
+            parse_work: None,
         }
     }
 
@@ -4289,13 +5017,38 @@ impl EntityExpansionMeter {
         // XML 1.0 section 4.4.2 defines recursive inclusion without a fixed depth ceiling. The
         // caller's recursion budget governs it; the internal clamp only protects native frames.
         // https://www.w3.org/TR/xml/#included
-        crate::budget::ensure(crate::BudgetKind::RecursionDepth, self.depth_limit, actual)
+        super::budget::ensure(super::BudgetKind::RecursionDepth, self.depth_limit, actual)
+    }
+
+    fn check_workspace(&self, additional: usize) -> Result<()> {
+        let actual = self
+            .used
+            .saturating_add(self.declaration_bytes)
+            .saturating_add(additional);
+        if actual > self.workspace {
+            return Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: self.workspace_maximum,
+                actual: self
+                    .workspace_maximum
+                    .saturating_sub(self.workspace)
+                    .saturating_add(actual),
+            });
+        }
+        Ok(())
+    }
+
+    fn release_declarations(&mut self, bytes: usize) {
+        self.declaration_bytes = self
+            .declaration_bytes
+            .checked_sub(bytes)
+            .expect("released declarations were admitted");
     }
 
     fn charge_reference(&self, references: &mut usize) -> Result<()> {
         let actual = references.saturating_add(1);
-        crate::budget::ensure(
-            crate::BudgetKind::EntityReferences,
+        super::budget::ensure(
+            super::BudgetKind::EntityReferences,
             self.reference_limit,
             actual,
         )?;
@@ -4305,18 +5058,49 @@ impl EntityExpansionMeter {
 
     fn append(&mut self, output: &mut String, value: &str) -> Result<()> {
         self.charge(value.len())?;
+        #[cfg(test)]
+        expansion_workspace_tests::APPENDED.with(|bytes| bytes.set(bytes.get() + value.len()));
+        let needed = output.len().checked_add(value.len()).ok_or(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: self.workspace,
+            actual: usize::MAX,
+        })?;
+        if needed > output.capacity() {
+            // A growing string can briefly hold its old and replacement blocks.
+            // Admit that peak before asking the allocator, not after materializing it.
+            let capacity = needed.max(output.capacity().saturating_mul(2));
+            self.check_workspace(capacity)?;
+            output
+                .try_reserve_exact(capacity - output.len())
+                .map_err(|_| Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit: self.workspace,
+                    actual: capacity,
+                })?;
+        }
         output.push_str(value);
         Ok(())
     }
 
     fn check(&self, amount: usize) -> Result<()> {
-        crate::budget::ensure(self.kind, self.limit, self.used.saturating_add(amount))
+        let actual = self.used.saturating_add(amount);
+        self.check_workspace(amount)?;
+        super::budget::ensure(self.kind, self.limit, actual)
     }
 
     fn charge(&mut self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
-        crate::budget::ensure(self.kind, self.limit, actual)?;
+        self.check_workspace(amount)?;
+        super::budget::ensure(self.kind, self.limit, actual)?;
+        self.charge_parse_work(amount)?;
         self.used = actual;
+        Ok(())
+    }
+
+    fn charge_parse_work(&mut self, amount: usize) -> Result<()> {
+        if let Some(work) = &mut self.parse_work {
+            work.charge(amount)?;
+        }
         Ok(())
     }
 }
@@ -4377,1729 +5161,395 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
         .map(str::to_owned)
 }
 
+#[cfg(all(test, not(feature = "embedded")))]
+mod parser_boundary_tests;
+
 #[cfg(test)]
-mod parser_boundary_tests {
-    use std::collections::HashMap;
-    use std::fmt::Write as _;
-    use std::sync::Arc;
+mod expansion_workspace_tests {
+    use super::*;
+    thread_local! { pub(super) static APPENDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { pub(super) static SCANNED_ATTRIBUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { pub(super) static NORMALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { pub(super) static CREATED_ROOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static DECLARATION_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-    use super::{
-        Attribute, Document, EntityExpansionMeter, Error, ExpandedName, Namespace, NodeKind,
-        Result, doctype_span, expand_document_entities, expand_entity_references,
-        expand_parameter_entity_references, internal_general_entities, namespace_for,
-        namespace_index, normalize_predefined_entity_declaration, parser_workspace_bytes,
-        prepare_xml_frontend_bounded, set_namespace,
-    };
-    use crate::budget::{ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter};
-    use crate::{BudgetKind, ExecutionBudget, ParseBudget};
-
-    fn nested_xml(depth: usize, leaf: &str) -> String {
-        format!("{}{}{}", "<n>".repeat(depth), leaf, "</n>".repeat(depth))
-    }
-
-    #[test]
-    fn fragment_xml_id_index_is_preflighted_before_mutation() {
-        let mut document = Document::empty(None);
-        document.push(
-            document.root(),
-            NodeKind::Element {
-                name: ExpandedName::new(None::<String>, "item"),
-                prefix: None,
-                attributes: vec![Attribute {
-                    name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "id"),
-                    prefix: Some("xml".into()),
-                    value: " target ".into(),
-                }],
-                namespaces: Arc::new(Vec::new()),
-            },
-            None,
-        );
-        let mut meter = Meter::new(
-            ExecutionBudget {
-                source_bytes: usize::MAX,
-                external_documents: usize::MAX,
-                recursion_depth: usize::MAX,
-                xpath_evaluations: usize::MAX,
-                xpath_operations: usize::MAX,
-                extension_operations: usize::MAX,
-                pattern_evaluations: usize::MAX,
-                template_applications: usize::MAX,
-                sort_comparisons: usize::MAX,
-                key_entries: usize::MAX,
-                result_nodes: usize::MAX,
-                serialized_bytes: usize::MAX,
-                messages: usize::MAX,
-                owned_bytes: 0,
-            },
-            0,
-        )
-        .expect("zero-byte meter initializes");
-
-        assert!(matches!(
-            document.finalize_xml_ids(&mut meter),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-        assert_eq!(document.ids().count(), 0);
-    }
-
-    #[test]
-    fn subtree_copy_stack_crosses_the_execution_owned_bytes_gate() {
-        // The copied nodes and remap are retained separately by the caller; this test isolates
-        // the additional DFS stack that exists only while a wide subtree is being copied.
-        let source =
-            Document::parse("<root><a/><b/><c/><d/><e/></root>", None).expect("source parses");
-        let source_root = source
-            .node(source.root())
-            .and_then(|root| root.children.first())
-            .copied()
-            .expect("source has a document element");
-        let mut target = Document::empty(None);
-        let mut mapping = HashMap::new();
-        let mut meter = Meter::new(
-            ExecutionBudget {
-                source_bytes: usize::MAX,
-                external_documents: usize::MAX,
-                recursion_depth: usize::MAX,
-                xpath_evaluations: usize::MAX,
-                xpath_operations: usize::MAX,
-                extension_operations: usize::MAX,
-                pattern_evaluations: usize::MAX,
-                template_applications: usize::MAX,
-                sort_comparisons: usize::MAX,
-                key_entries: usize::MAX,
-                result_nodes: usize::MAX,
-                serialized_bytes: usize::MAX,
-                messages: usize::MAX,
-                owned_bytes: 0,
-            },
-            0,
-        )
-        .expect("zero-byte meter initializes");
-
-        assert!(matches!(
-            target.append_subtree_from(
-                target.root(),
-                &source,
-                source_root,
-                &mut mapping,
-                &mut meter,
-            ),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-    }
-
-    fn parse_tree_with_oracle_stack(xml: &str, base_uri: Option<&str>) -> Result<Document> {
-        let xml = xml.to_owned();
-        let base_uri = base_uri.map(str::to_owned);
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || Document::parse_tree(&xml, base_uri.as_deref()))
-            .expect("parser oracle thread starts")
-            .join()
-            .expect("parser oracle thread does not panic")
-    }
-
-    #[test]
-    fn xinclude_entity_merge_accepts_duplicates_and_rejects_conflicts() {
-        // XInclude 1.0 section 4.5.1 collapses duplicate entity metadata but makes a
-        // same-name, different-identity entity fatal.
-        // https://www.w3.org/TR/xinclude/#unparsed-entities
-        let mut output = Document::empty(None);
-        output
-            .register_unparsed_entity("logo", "memory:logo.png")
-            .expect("result entity registers");
-        let mut duplicate = Document::empty(None);
-        duplicate
-            .register_unparsed_entity("logo", "memory:logo.png")
-            .expect("duplicate source entity registers");
-        output
-            .merge_unparsed_entities_from(&duplicate, output.root())
-            .expect("identical entity metadata coalesces");
-
-        let mut conflicting = Document::empty(None);
-        conflicting
-            .register_unparsed_entity("logo", "memory:other.png")
-            .expect("conflicting source entity registers");
-        assert!(
-            output
-                .merge_unparsed_entities_from(&conflicting, output.root())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn oracle_and_iterative_parsers_have_identical_boundary_semantics() {
-        // Attacker-controlled depth must not select a different namespace, ID, or node model.
-        for depth in (62..=66).chain(126..=130) {
-            let xml = nested_xml(
-                depth,
-                r#"<p:leaf xmlns:p="urn:leaf" xml:id="target" p:value="ok">text</p:leaf>"#,
-            );
-            let tree = parse_tree_with_oracle_stack(&xml, Some("memory:source.xml"))
-                .expect("tree parser accepts boundary document");
-            let iterative = Document::parse_iterative(&xml, Some("memory:source.xml"))
-                .expect("iterative parser accepts boundary document");
-            assert_eq!(tree, iterative, "parser models differ at depth {depth}");
+    pub(super) fn observe_declarations(declarations: &InternalEntityDeclarations) {
+        let mut bytes = 0;
+        for map in [
+            &declarations.general,
+            &declarations.parameter,
+            &declarations.unparsed,
+        ] {
+            bytes += map.capacity()
+                * (std::mem::size_of::<(String, String)>() + std::mem::size_of::<u64>());
+            bytes += map
+                .iter()
+                .map(|(name, value)| name.capacity() + value.capacity())
+                .sum::<usize>();
         }
-    }
-
-    #[test]
-    fn nested_elements_share_unchanged_namespace_scopes() {
-        let document = Document::parse(
-            r#"<root xmlns:p="urn:test"><first><second/></first></root>"#,
-            None,
-        )
-        .expect("nested namespace document parses");
-        let scopes = document.nodes.iter().filter_map(|node| match &node.kind {
-            NodeKind::Element { namespaces, .. } => Some(namespaces),
-            _ => None,
-        });
-        let scopes = scopes.collect::<Vec<_>>();
-        assert_eq!(scopes.len(), 3);
-        assert!(Arc::ptr_eq(scopes[0], scopes[1]));
-        assert!(Arc::ptr_eq(scopes[1], scopes[2]));
-    }
-
-    #[test]
-    fn empty_xml_base_preserves_a_path_like_document_uri() {
-        // RFC 3986 empty references retain the current document path while
-        // removing its fragment; treating the base as a directory moves it.
-        let document = Document::parse(
-            r#"<root xml:base=""><child/></root>"#,
-            Some("/tmp/styles/main.xml#source"),
-        )
-        .expect("path-like base parses");
-        let root = document
-            .nodes()
-            .find_map(|(_, node)| {
-                matches!(node.kind, super::NodeKind::Element { .. }).then_some(node)
-            })
-            .expect("document element exists");
-        assert_eq!(root.base_uri.as_deref(), Some("/tmp/styles/main.xml"));
-    }
-
-    #[test]
-    fn defaulted_xml_base_recomputes_the_complete_subtree() {
-        // XML Base section 3 permits xml:base to be supplied by defaulting, and section 4.2
-        // applies it to the owning element and descendants.
-        // https://www.w3.org/TR/xmlbase/#syntax
-        // https://www.w3.org/TR/xmlbase/#granularity
-        let mut document = Document::parse(
-            r#"<root><child xml:base="nested/"><leaf/></child><sibling/></root>"#,
-            Some("https://example.test/original/source.xml"),
-        )
-        .expect("source document parses");
-        let element = |document: &Document, local: &str| {
-            document
-                .nodes()
-                .find_map(|(id, node)| match &node.kind {
-                    NodeKind::Element { name, .. } if name.local == local => Some(id),
-                    _ => None,
+        for set in [
+            &declarations.declared_general,
+            &declarations.parsed_external,
+        ] {
+            bytes += set.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<u64>());
+            bytes += set.iter().map(String::capacity).sum::<usize>();
+        }
+        bytes += declarations.parameter_spans.capacity() * std::mem::size_of::<(usize, usize)>();
+        bytes += declarations.attributes.capacity()
+            * (std::mem::size_of::<(String, Vec<InternalAttributeDeclaration>)>()
+                + std::mem::size_of::<u64>());
+        for (name, attributes) in &declarations.attributes {
+            bytes += name.capacity()
+                + attributes.capacity() * std::mem::size_of::<InternalAttributeDeclaration>();
+            bytes += attributes
+                .iter()
+                .map(|attribute| {
+                    attribute.name.capacity()
+                        + attribute.default.as_ref().map_or(0, String::capacity)
                 })
-                .expect("named element exists")
-        };
-        let root = element(&document, "root");
-        document
-            .add_default_attribute(
-                root,
-                Attribute {
-                    name: ExpandedName::new(Some(super::XML_NS), "base"),
-                    prefix: Some("xml".into()),
-                    value: "../default/".into(),
-                },
-            )
-            .expect("trusted defaulted xml:base is applied");
-
-        let base = |local| {
-            document
-                .node(element(&document, local))
-                .and_then(|node| node.base_uri.as_deref())
-        };
-        assert_eq!(base("root"), Some("https://example.test/default/"));
-        assert_eq!(base("child"), Some("https://example.test/default/nested/"));
-        assert_eq!(base("leaf"), Some("https://example.test/default/nested/"));
-        assert_eq!(base("sibling"), Some("https://example.test/default/"));
-    }
-
-    #[test]
-    fn oracle_and_iterative_parsers_coalesce_adjacent_character_data() {
-        // Tokenizer event boundaries are not XPath text-node boundaries: text, references and
-        // CDATA in one character-data run must project as one semantic text node.
-        for depth in 126..=130 {
-            let xml = nested_xml(depth, "<leaf>a&amp;b&#x21;<![CDATA[c]]>d</leaf>");
-            let tree = parse_tree_with_oracle_stack(&xml, None)
-                .expect("tree parser accepts adjacent character data");
-            let iterative = Document::parse_iterative(&xml, None)
-                .expect("iterative parser accepts adjacent character data");
-            assert_eq!(tree, iterative, "text projection differs at depth {depth}");
+                .sum::<usize>();
         }
+        DECLARATION_BYTES.with(|peak| peak.set(peak.get().max(bytes)));
     }
 
     #[test]
-    fn iterative_parser_excludes_the_pi_separator_from_data() {
-        // XML's mandatory S between PITarget and data is syntax, not part of
-        // the processing-instruction value exposed by the semantic model.
-        let document = Document::parse_iterative("<root><?target   value ?></root>", None)
-            .expect("processing instruction parses");
-        let value = document.nodes().find_map(|(_, node)| match &node.kind {
-            super::NodeKind::ProcessingInstruction { value, .. } => value.as_deref(),
-            _ => None,
-        });
-        assert_eq!(value, Some("value "));
+    fn unused_literal_declarations_do_not_spend_expansion_output() {
+        // Retaining a literal declaration is workspace, not expansion output.
+        // No reference is expanded here, even with a zero expansion quota.
+        let mut meter = EntityExpansionMeter::new(0);
+        let declarations =
+            collect_internal_entity_declarations("<!ENTITY unused 'literal'>", &mut meter)
+                .expect("literal declaration needs no expansion output");
+        assert_eq!(declarations.general["unused"], "literal");
+        assert_eq!(meter.used, 0);
     }
 
     #[test]
-    fn iterative_parser_bounds_entity_references_across_the_document() {
-        // Sibling references share one expansion allowance; resetting the
-        // counter per sibling makes total expanded output attacker-controlled.
-        let body = format!("<leaf>{}</leaf>", "&e;".repeat(256));
-        let xml = format!(r#"<!DOCTYPE n [<!ENTITY e "x">]>{}"#, nested_xml(65, &body));
-
-        let budget = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            255,
-            usize::MAX,
-            usize::MAX,
-        );
-        assert!(matches!(
-            Document::parse_with_budget(&xml, None, budget),
-            Err(Error::Budget {
-                kind: BudgetKind::EntityReferences,
-                limit: 255,
-                actual: 256,
-            })
-        ));
+    fn coalesced_text_keeps_reference_carriage_returns() {
+        // XML 1.0 section 2.11 normalizes literal CR/CRLF, not a CR produced
+        // by a character reference. Text and CDATA still coalesce in one node.
+        let document = Document::parse("<r>a\r\nb\rc&#13;<![CDATA[d\r\ne]]>f</r>", None)
+            .expect("mixed text parses");
+        assert_eq!(document.string_value(document.root()), "a\nb\nc\rd\nef");
     }
 
     #[test]
-    fn general_entities_cannot_supply_or_follow_the_document_element() {
-        // XML 1.0 production [1] requires one literal document element surrounded only by
-        // prolog and Misc; entity references are content and cannot occupy either outer region.
-        // https://www.w3.org/TR/xml/#sec-well-formed
-        for malformed in [
-            r#"<!DOCTYPE root [<!ENTITY root "<root/>">]>&root;"#,
-            r#"<!DOCTYPE root [<!ENTITY empty "">]><root/>&empty;"#,
-        ] {
-            assert!(
-                matches!(Document::parse(malformed, None), Err(Error::Xml(_))),
-                "outer entity reference must remain malformed: {malformed}"
-            );
-        }
-
-        let valid = Document::parse(
-            r#"<!DOCTYPE root [<!ENTITY child "<child>ok</child>">]><root>&child;</root>"#,
-            None,
-        )
-        .expect("an entity in document content remains valid");
-        assert_eq!(valid.string_value(valid.root()), "ok");
-    }
-
-    #[test]
-    fn entity_replacement_normalizes_character_references_before_parsing() {
-        // XML 1.0 section 4.5 expands character references when constructing replacement
-        // text, so an encoded '<' can introduce markup when the entity is referenced.
-        let document = Document::parse(r#"<!DOCTYPE r [<!ENTITY e "&#60;a/>">]><r>&e;</r>"#, None)
-            .expect("replacement markup is well formed");
-        assert_eq!(document.string_value(document.root()), "");
-        assert!(document.nodes().any(|(_, node)| matches!(&node.kind,
-            super::NodeKind::Element { name, .. } if name.local == "a")));
-    }
-
-    #[test]
-    fn internal_entity_values_reject_parameter_references() {
-        // XML 1.0 section 2.8 WFC PEs in Internal Subset forbids references inside
-        // declarations, including EntityValue, before any expansion erases their origin.
-        for xml in [
-            r#"<!DOCTYPE r [<!ENTITY % p "x"><!ENTITY e "%p;">]><r>&e;</r>"#,
-            r#"<!DOCTYPE r [<!ENTITY % p "x"><!ENTITY % q "%p;">]><r/>"#,
-        ] {
-            assert!(
-                matches!(Document::parse(xml, None), Err(Error::Xml(_))),
-                "{xml}"
-            );
-        }
-    }
-
-    #[test]
-    fn general_entity_markup_is_balanced_within_each_replacement() {
-        // XML 1.0 section 4.3.2 requires every referenced internal general entity replacement
-        // to match `content`; a tag cannot begin in one entity and end in another.
-        // https://www.w3.org/TR/xml/#wf-entities
-        for malformed in [
-            r#"<!DOCTYPE root [<!ENTITY e "</root>">]><root>&e;"#,
-            r#"<!DOCTYPE root [<!ENTITY e "<child>">]><root>&e;</child></root>"#,
-        ] {
-            assert!(
-                matches!(Document::parse(malformed, None), Err(Error::Xml(_))),
-                "cross-entity markup must remain malformed: {malformed}"
-            );
-        }
-
-        let valid = Document::parse(
-            r#"<!DOCTYPE root [<!ENTITY e "<child>ok</child>">]><root>&e;</root>"#,
-            None,
-        )
-        .expect("balanced replacement content parses");
-        assert_eq!(valid.string_value(valid.root()), "ok");
-    }
-
-    #[test]
-    fn parse_budget_controls_entity_reference_occurrences() {
-        // XML 1.0 section 4.1 defines reference syntax but no occurrence ceiling; this is a
-        // caller-selected resource limit rather than malformed XML.
-        // https://www.w3.org/TR/xml/#sec-references
-        let xml = format!(
-            r#"<!DOCTYPE root [<!ENTITY e "x">]><root>{}</root>"#,
-            "&e;".repeat(256)
-        );
-        let constrained = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            255,
-            usize::MAX,
-            usize::MAX,
-        );
-        assert!(matches!(
-            Document::parse_with_budget(&xml, None, constrained),
-            Err(Error::Budget {
-                kind: BudgetKind::EntityReferences,
-                limit: 255,
-                actual: 256,
-            })
-        ));
-
-        let admitted = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            256,
-            usize::MAX,
-            usize::MAX,
-        );
-        Document::parse_with_budget(&xml, None, admitted)
-            .expect("the caller-selected reference limit admits its exact boundary");
-    }
-
-    #[test]
-    fn parse_budget_bounds_entity_expansion_bytes() {
-        // XML 1.0 section 4.4.2 defines replacement-text inclusion but no byte ceiling, so the
-        // caller's typed resource budget must bound the materialized expansion.
-        // https://www.w3.org/TR/xml/#included
-        let xml = r#"<!DOCTYPE root [<!ENTITY a "0123456789"><!ENTITY b "&a;&a;&a;&a;">]><root>&b;</root>"#;
-        let budget = ParseBudget::new(xml.len(), usize::MAX, usize::MAX, usize::MAX, 1, usize::MAX);
-        assert!(matches!(
-            Document::parse_with_budget(xml, None, budget),
-            Err(Error::Budget {
-                kind: BudgetKind::EntityExpansionBytes,
-                limit: 1,
-                actual,
-            }) if actual > 1
-        ));
-
-        let admitted = ParseBudget::new(
-            xml.len(),
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            ENTITY_EXPANSION_BYTE_CEILING,
-            usize::MAX,
-        );
-        Document::parse_with_budget(xml, None, admitted)
-            .expect("a sufficient entity-expansion budget admits the same document");
-    }
-
-    #[test]
-    fn parse_budget_controls_entity_expansion_depth() {
-        // XML 1.0 section 4.4.2 requires included replacement text to be processed in place and
-        // defines no fixed nesting ceiling; recursion is therefore a caller-selected budget.
-        // https://www.w3.org/TR/xml/#included
-        let declarations = (0..12)
-            .map(|depth| {
-                let replacement = if depth == 11 {
-                    "expanded".to_owned()
-                } else {
-                    format!("&e{};", depth + 1)
-                };
-                format!(r#"<!ENTITY e{depth} "{replacement}">"#)
-            })
+    fn retained_dtd_declarations_are_admitted_before_materialization() {
+        // Unused values, name indexes, spans and ATTLIST vectors remain live
+        // while the tiny tree is parsed; output expansion limits cannot pay for them.
+        let large = "x".repeat(64 * 1024);
+        let general = (0..128)
+            .map(|i| format!("<!ENTITY e{i} ''>"))
             .collect::<String>();
-        let xml = format!("<!DOCTYPE root [{declarations}]><root>&e0;</root>");
-        let constrained = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            11,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-        );
-        assert!(matches!(
-            Document::parse_with_budget(&xml, None, constrained),
-            Err(Error::Budget {
-                kind: BudgetKind::RecursionDepth,
-                limit: 11,
-                actual: 12,
-            })
-        ));
-
-        let admitted = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            12,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-        );
-        let document = Document::parse_with_budget(&xml, None, admitted)
-            .expect("the caller-selected depth admits the entity chain");
-        assert_eq!(document.string_value(document.root()), "expanded");
-    }
-
-    #[test]
-    fn parse_budget_controls_namespace_scope_materialization() {
-        // Namespaces in XML 1.0 section 6.1 defines scope but no storage ceiling; the parser must
-        // classify its allocation guard as caller-selected resource policy.
-        // https://www.w3.org/TR/xml-names/#scoping
-        let xml = "<root xmlns:p='urn:p'><p:child/></root>";
-        let mut exact_limit = 0;
-        loop {
-            let candidate = ParseBudget::new(
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-                exact_limit,
+        let parameter = (0..128)
+            .map(|i| format!("<!ENTITY % p{i} ''>"))
+            .collect::<String>();
+        let external = (0..128)
+            .map(|i| format!("<!ENTITY x{i} SYSTEM 'external'>"))
+            .collect::<String>();
+        let unparsed = (0..128)
+            .map(|i| format!("<!ENTITY u{i} SYSTEM 'asset' NDATA n>"))
+            .collect::<String>();
+        let attributes = (0..128)
+            .map(|i| format!(" a{i} CDATA #IMPLIED"))
+            .collect::<String>();
+        let subsets = [
+            format!("<!ENTITY e '{large}'>"),
+            format!("<!ENTITY % p '{large}'>"),
+            format!("<!ATTLIST other a CDATA '{large}'>"),
+            format!("<!NOTATION n SYSTEM 'n'><!ENTITY u SYSTEM '{large}' NDATA n>"),
+            general,
+            parameter,
+            external,
+            format!("<!NOTATION n SYSTEM 'n'>{unparsed}"),
+            format!("<!ATTLIST other{attributes}>"),
+        ];
+        let mut violations = Vec::new();
+        for (case, subset) in subsets.into_iter().enumerate() {
+            let xml = format!("<!DOCTYPE r [{subset}]><r/>");
+            DECLARATION_BYTES.with(|bytes| bytes.set(0));
+            let result = Document::parse_with_budget(
+                &xml,
+                None,
+                ParseBudget::UNBOUNDED.with_owned_bytes(4096),
             );
-            match Document::parse_with_budget(xml, None, candidate) {
-                Ok(_) => break,
+            let peak = DECLARATION_BYTES.with(std::cell::Cell::get);
+            let refused = matches!(
+                result,
                 Err(Error::Budget {
-                    kind: BudgetKind::NamespaceScopeBytes,
-                    actual,
+                    kind: BudgetKind::OwnedBytes,
                     ..
-                }) => {
-                    assert!(actual > exact_limit);
-                    exact_limit = actual;
-                }
-                Err(_) => panic!("namespace storage must use the typed parse-budget contract"),
+                })
+            );
+            if !refused || peak > 4096 {
+                violations.push((case, peak, refused));
             }
-        }
-        let below_boundary = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            exact_limit - 1,
-        );
-        assert!(matches!(
-            Document::parse_with_budget(xml, None, below_boundary),
-            Err(Error::Budget {
-                kind: BudgetKind::NamespaceScopeBytes,
-                actual,
-                ..
-            }) if actual == exact_limit
-        ));
-
-        let admitted = ParseBudget::new(
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            exact_limit,
-        );
-        Document::parse_with_budget(xml, None, admitted)
-            .expect("the caller-selected namespace limit admits its exact boundary");
-    }
-
-    #[test]
-    fn iterative_parser_registers_dtd_declared_id_attributes() {
-        // XML 1.0 section 3.3.1 assigns ID semantics to attributes declared with type ID;
-        // XPath id() must therefore resolve them without caller-supplied metadata.
-        // https://www.w3.org/TR/xml/#sec-attribute-types
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE root [<!ATTLIST item key ID #REQUIRED>]><root><item key="target"/></root>"#,
-            None,
-        )
-        .expect("DTD-declared ID parses");
-        let owner = document
-            .nodes()
-            .find_map(|(id, node)| match &node.kind {
-                NodeKind::Element { name, .. } if name.local == "item" => Some(id),
-                _ => None,
-            })
-            .expect("ID owner exists");
-
-        assert!(
-            document
-                .ids()
-                .any(|(value, root, registered_owner)| value == "target"
-                    && root == document.root()
-                    && registered_owner == owner)
-        );
-    }
-
-    #[test]
-    fn iterative_parser_does_not_enforce_dtd_id_validity() {
-        // XML 1.0 sections 3.3.1 and 5.1 make the ID Name rule a validity constraint, not a
-        // well-formedness constraint required of this non-validating parser.
-        // https://www.w3.org/TR/xml/#id
-        // https://www.w3.org/TR/xml/#proc-types
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE r [<!ATTLIST r id ID #IMPLIED>]><r id="1bad"/>"#,
-            None,
-        )
-        .expect("a non-validating parser accepts a validity-constraint violation");
-
-        assert!(document.ids().any(|(value, _, _)| value == "1bad"));
-    }
-
-    #[test]
-    fn iterative_parser_coalesces_dtd_and_xml_id_registration() {
-        // xml:id 1.0 section 4 gives xml:id ID semantics independently of the DTD. If the DTD
-        // declares that same attribute as ID, both mechanisms identify one attribute rather than
-        // two competing IDs: https://www.w3.org/TR/xml-id/#processing
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE root [<!ATTLIST item xml:id ID #REQUIRED>]><root><item xml:id="target"/></root>"#,
-            None,
-        )
-        .expect("the same xml:id registration is idempotent");
-
-        assert_eq!(
-            document
-                .ids()
-                .filter(|(value, _, _)| *value == "target")
-                .count(),
-            1
-        );
-
-        let error = Document::parse_iterative(
-            r#"<!DOCTYPE root [<!ATTLIST item xml:id ID #REQUIRED>]><root><item xml:id="same"/><item xml:id="same"/></root>"#,
-            None,
-        )
-        .expect_err("the same ID on distinct owners remains invalid");
-        assert!(error.to_string().contains("duplicate XML ID"));
-    }
-
-    #[test]
-    fn defaulted_xml_id_is_processed_atomically() {
-        // xml:id 1.0 section 4 applies to attributes added to the infoset by default and requires
-        // normalization before ID assignment: https://www.w3.org/TR/xml-id/#processing
-        let mut document = Document::parse("<root><first/><second/></root>", None)
-            .expect("source document parses");
-        let elements = document
-            .nodes()
-            .filter_map(|(id, node)| match &node.kind {
-                NodeKind::Element { name, .. } if name.local != "root" => Some(id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let [first, second] = elements.as_slice() else {
-            panic!("two child elements exist");
-        };
-        let (first, second) = (*first, *second);
-        let xml_id = |value: &str| Attribute {
-            name: ExpandedName::new(Some("http://www.w3.org/XML/1998/namespace"), "id"),
-            prefix: Some("xml".into()),
-            value: value.into(),
-        };
-
-        document
-            .add_default_attribute(first, xml_id("  target  "))
-            .expect("defaulted xml:id is accepted");
-        assert!(document.ids().any(|(value, root, owner)| value == "target"
-            && root == document.root()
-            && owner == first));
-        let first_attributes = match &document.node(first).expect("first remains present").kind {
-            NodeKind::Element { attributes, .. } => attributes,
-            _ => panic!("first remains an element"),
-        };
-        assert_eq!(first_attributes[0].value, "target");
-
-        let invalid = document
-            .add_default_attribute(second, xml_id("not valid"))
-            .expect_err("invalid defaulted xml:id is rejected");
-        assert!(invalid.to_string().contains("NCName"));
-        let duplicate = document
-            .add_default_attribute(second, xml_id("target"))
-            .expect_err("duplicate defaulted xml:id is rejected");
-        assert!(duplicate.to_string().contains("duplicate XML ID"));
-        let second_attributes = match &document.node(second).expect("second remains present").kind {
-            NodeKind::Element { attributes, .. } => attributes,
-            _ => panic!("second remains an element"),
-        };
-        assert!(second_attributes.is_empty(), "failed additions are atomic");
-    }
-
-    #[test]
-    fn iterative_parser_does_not_enforce_dtd_id_uniqueness() {
-        // XML 1.0 sections 3.3.1 and 5.1 make ID uniqueness a validity constraint that this
-        // non-validating parser must not turn into a fatal well-formedness error.
-        // https://www.w3.org/TR/xml/#id
-        // https://www.w3.org/TR/xml/#proc-types
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE root [<!ATTLIST item key ID #REQUIRED>]><root><item key="same"/><item key="same"/></root>"#,
-            None,
-        )
-        .expect("duplicate DTD-declared ID values remain parseable");
-
-        assert_eq!(
-            document
-                .ids()
-                .filter(|(value, _, _)| *value == "same")
-                .count(),
-            1,
-            "the deterministic ID index keeps its first declaration"
-        );
-    }
-
-    #[test]
-    fn iterative_parser_does_not_enforce_one_dtd_id_per_element_type() {
-        // XML 1.0 sections 3.3.1 and 5.1 classify the one-ID-per-element-type rule as validity,
-        // while both declarations still provide ID typing to a non-validating processor.
-        // https://www.w3.org/TR/xml/#one-id-per-el
-        // https://www.w3.org/TR/xml/#proc-types
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE root [<!ATTLIST item first ID #IMPLIED second ID #IMPLIED>]><root><item first="one" second="two"/></root>"#,
-            None,
-        )
-        .expect("multiple DTD-declared ID attributes remain parseable");
-
-        assert!(document.ids().any(|(value, _, _)| value == "one"));
-        assert!(document.ids().any(|(value, _, _)| value == "two"));
-    }
-
-    #[test]
-    fn iterative_parser_bounds_aggregate_text_entity_expansion_bytes() {
-        // A bounded reference count is insufficient when each permitted
-        // reference materializes a large replacement into document text.
-        let replacement = "x".repeat(70_000);
-        let body = "&large;".repeat(255);
-        let xml = format!("<!DOCTYPE root [<!ENTITY large \"{replacement}\">]><root>{body}</root>");
-
-        let error = Document::parse_iterative(&xml, None)
-            .expect_err("aggregate expanded text must remain bounded");
-        assert!(matches!(error, crate::Error::Budget { .. }));
-    }
-
-    #[test]
-    fn iterative_parser_bounds_aggregate_attribute_entity_expansion_bytes() {
-        // Attribute expansion happens after the document-level lexical pass
-        // and must consume the same document-wide materialization budget.
-        let replacement = "x".repeat(70_000);
-        let mut attributes = String::new();
-        for index in 0..255 {
-            write!(attributes, " a{index}=\"&large;\"")
-                .expect("writing attributes to String cannot fail");
-        }
-        let xml = format!("<!DOCTYPE root [<!ENTITY large \"{replacement}\">]><root{attributes}/>");
-
-        let error = Document::parse_iterative(&xml, None)
-            .expect_err("aggregate expanded attributes must remain bounded");
-        assert!(matches!(error, crate::Error::Budget { .. }));
-    }
-
-    #[test]
-    fn oracle_and_iterative_parsers_reject_the_same_boundary_malformations() {
-        // Namespace and document-well-formedness failures cannot depend on document depth.
-        for depth in (62..=66).chain(126..=130) {
-            for leaf in [
-                "<p:leaf/>",
-                "<p:a:b xmlns:p=\"urn:p\"/>",
-                "<:leaf/>",
-                "<leaf:/>",
-                "<leaf p:a:b=\"x\" xmlns:p=\"urn:p\"/>",
-                "<leaf xmlns:a=\"urn:u\" xmlns:b=\"urn:u\" a:x=\"1\" b:x=\"2\"/>",
-                "<leaf xmlns:xml=\"urn:wrong\"/>",
-                "<leaf xmlns:p=\"\"/>",
-                "<leaf>&#0;</leaf>",
-                "<leaf>&#x1;</leaf>",
-            ] {
-                let xml = nested_xml(depth, leaf);
-                let tree_ok = parse_tree_with_oracle_stack(&xml, None).is_ok();
-                let iterative_ok = Document::parse_iterative(&xml, None).is_ok();
-                assert!(
-                    !tree_ok,
-                    "tree parser accepted malformed input at depth {depth}: {leaf}"
-                );
-                assert_eq!(
-                    tree_ok, iterative_ok,
-                    "parser acceptance differs at depth {depth} for {leaf}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn iterative_parser_rejects_mismatched_closing_names() {
-        // Deep documents select the iterative parser, which must enforce the
-        // same lexical element nesting invariant as the regular parser.
-        let xml = nested_xml(65, "<expected></different>");
-        assert!(parse_tree_with_oracle_stack(&xml, None).is_err());
-        assert!(
-            Document::parse_iterative(&xml, None).is_err(),
-            "iterative parser accepted a mismatched closing element"
-        );
-    }
-
-    #[test]
-    fn iterative_parser_expands_entities_inside_attribute_value_context() {
-        // Entity replacement text is interpreted inside the attribute value;
-        // a quote in that text must not terminate the source-level delimiter.
-        let xml = r#"<!DOCTYPE root [<!ENTITY quote "'">]><root value='&quote;'/>"#;
-        let iterative = Document::parse_iterative(xml, None)
-            .expect("iterative parser must preserve attribute quoting");
-        let value = iterative.nodes().find_map(|(_, node)| match &node.kind {
-            super::NodeKind::Element { attributes, .. } => attributes
-                .iter()
-                .find(|attribute| attribute.name.local == "value")
-                .map(|attribute| attribute.value.as_str()),
-            _ => None,
-        });
-        assert_eq!(value, Some("'"));
-    }
-
-    #[test]
-    fn oracle_and_iterative_parsers_reject_misplaced_and_duplicate_doctypes() {
-        // Document depth must not make invalid prolog structure acceptable.
-        let deep_document = nested_xml(65, "<leaf/>");
-        for xml in [
-            format!("<!DOCTYPE n><!DOCTYPE n>{deep_document}"),
-            nested_xml(65, "<!DOCTYPE leaf><leaf/>"),
-        ] {
-            assert!(
-                parse_tree_with_oracle_stack(&xml, None).is_err(),
-                "tree parser accepted malformed doctype placement"
-            );
-            assert!(
-                Document::parse_iterative(&xml, None).is_err(),
-                "iterative parser accepted malformed doctype placement"
-            );
-        }
-    }
-
-    #[test]
-    fn every_parser_accepts_a_doctype_for_another_document_element() {
-        // XML 1.0 section 2.8 defines the name match as a validity constraint; section 5.1 does
-        // not require a non-validating processor to enforce it.
-        let shallow = "<!DOCTYPE expected><actual/>";
-        Document::parse(shallow, None).expect("shallow non-validating parse accepts the document");
-        Document::parse_iterative(shallow, None)
-            .expect("iterative non-validating parse accepts the document");
-
-        let deep = format!("<!DOCTYPE expected>{}", nested_xml(130, "<actual/>"));
-        Document::parse(&deep, None).expect("deep dispatch accepts the validity-only mismatch");
-        Document::parse_iterative(&deep, None)
-            .expect("iterative parser accepts the validity-only mismatch");
-    }
-
-    #[test]
-    fn parser_paths_count_xml_line_endings_identically() {
-        // XML 1.0 section 2.11 normalizes CR, CRLF, and LF to one logical line ending.
-        for separator in ["\n", "\r", "\r\n"] {
-            let xml = format!("<root>{separator}<child/></root>");
-            for document in [
-                Document::parse_tree(&xml, None).expect("tree parser accepts line ending"),
-                Document::parse_iterative(&xml, None)
-                    .expect("iterative parser accepts line ending"),
-            ] {
-                let child = document
-                    .nodes()
-                    .find_map(|(_, node)| match &node.kind {
-                        NodeKind::Element { name, .. } if name.local == "child" => Some(node),
-                        _ => None,
-                    })
-                    .expect("child exists");
-                assert_eq!(child.source_line, Some(2), "separator {separator:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn doctype_discovery_is_limited_to_the_document_prolog() {
-        // Lexical lookalikes in comments and character data are not declarations.
-        for xml in [
-            "<!-- <!DOCTYPE fake [<!ENTITY e 'bad'>]> --><root/>",
-            "<root><![CDATA[<!DOCTYPE fake [<!ENTITY e 'bad'>]>]]></root>",
-        ] {
-            assert_eq!(doctype_span(xml).expect("doctype scan succeeds"), None);
-            Document::parse_iterative(xml, None).expect("document parses without a doctype");
-        }
-    }
-
-    #[test]
-    fn dtd_processing_instructions_cannot_declare_entities() {
-        // Processing-instruction content is a protected DTD region. Markup-shaped text inside it
-        // must not become a declaration consumed by the entity-expansion pass.
-        let xml = r#"<!DOCTYPE r [<?pi <!ENTITY e "evil">?>]><r>&e;</r>"#;
-        assert!(Document::parse_iterative(xml, None).is_err());
-    }
-
-    #[test]
-    fn external_identifier_brackets_do_not_form_an_internal_subset() {
-        // XML 1.0 only permits the internal subset after the external identifier, outside its
-        // quoted SystemLiteral: https://www.w3.org/TR/xml/#NT-doctypedecl
-        let xml = r#"<!DOCTYPE r SYSTEM "[<!ENTITY e 'ok'>]"><r>&e;</r>"#;
-        assert!(Document::parse_iterative(xml, None).is_err());
-    }
-
-    #[test]
-    fn unused_entity_definitions_reject_invalid_grammar() {
-        // XML 1.0 [70]-[74]: unused declarations still need a complete EntityDef/PEDef.
-        for declaration in [
-            "<!ENTITY e BOGUS>",
-            "<!ENTITY % e BOGUS>",
-            "<!ENTITY e 'value' BOGUS>",
-            "<!ENTITY e 'value' NDATA notation>",
-        ] {
-            let xml = format!("<!DOCTYPE root [{declaration}]><root/>");
-            assert!(
-                Document::parse(&xml, None).is_err(),
-                "accepted {declaration}"
-            );
-            assert!(
-                Document::parse_iterative(&xml, None).is_err(),
-                "iterative accepted {declaration}"
-            );
-            assert!(
-                super::collect_internal_entity_declarations(
-                    declaration,
-                    &EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
-                )
-                .is_err(),
-                "preprocessor accepted {declaration}"
-            );
-        }
-    }
-
-    #[test]
-    fn unused_entity_graphs_obey_well_formedness() {
-        // XML 1.0 section 4.1 applies Entity Declared and No Recursion to unused declarations.
-        for subset in [
-            "<!ENTITY a '&missing;'>",
-            "<!ENTITY a '&a;'>",
-            "<!ENTITY a '&b;'><!ENTITY b '&a;'>",
-        ] {
-            let xml = format!("<!DOCTYPE root [{subset}]><root/>");
-            assert!(Document::parse(&xml, None).is_err(), "accepted {subset}");
-        }
-        // Forward references between general entities are legal; unused text is not expanded.
-        Document::parse(
-            "<!DOCTYPE root [<!ENTITY a '&b;'><!ENTITY b 'ok'>]><root/>",
-            None,
-        )
-        .expect("acyclic forward reference is valid");
-        Document::parse(
-            "<!DOCTYPE root SYSTEM 'memory:external.dtd' [<!ENTITY a '&external;'>]><root/>",
-            None,
-        )
-        .expect("non-validating processor need not read an external declaration");
-        assert!(Document::parse("<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'memory:external.dtd' [<!ENTITY a '&external;'>]><root/>", None).is_err());
-        Document::parse("<!DOCTYPE root [<!ENTITY a '&amp;missing;'>]><root/>", None)
-            .expect("escaped ampersand does not declare a dependency");
-    }
-
-    #[test]
-    fn external_entity_system_literals_reject_fragment_identifiers() {
-        // XML 1.0 section 4.2.2 makes a fragment identifier in a system identifier an error:
-        // https://www.w3.org/TR/xml/#sec-external-ent
-        for declaration in [
-            r#"<!ENTITY logo SYSTEM "image.bin#part" NDATA png>"#,
-            r#"<!ENTITY logo PUBLIC "image" "image.bin#part" NDATA png>"#,
-            r#"<!NOTATION png SYSTEM "image.bin#part">"#,
-            r#"<!NOTATION png PUBLIC "image" "image.bin#part">"#,
-        ] {
-            let xml = format!("<!DOCTYPE root [{declaration}]><root/>");
-            assert!(Document::parse(&xml, None).is_err());
-            assert!(Document::parse_iterative(&xml, None).is_err());
-        }
-
-        let valid = r#"<!DOCTYPE root [<!NOTATION png SYSTEM "image/png"><!ENTITY logo SYSTEM "image.bin" NDATA png>]><root/>"#;
-        Document::parse(valid, None).expect("fragment-free system identifier is valid");
-        Document::parse_iterative(valid, None)
-            .expect("fragment-free system identifier is valid in the iterative parser");
-    }
-
-    #[test]
-    fn unparsed_entities_accept_empty_system_literals() {
-        // XML 1.0 production [11] permits an empty SystemLiteral. Both parser paths must retain
-        // that empty URI as unparsed-entity metadata instead of rejecting the document.
-        // https://www.w3.org/TR/xml/#NT-SystemLiteral
-        let xml = r#"<!DOCTYPE root [<!NOTATION png SYSTEM "image/png"><!ENTITY logo SYSTEM "" NDATA png>]><root/>"#;
-        for document in [
-            Document::parse(xml, None).expect("empty system identifier is well-formed"),
-            Document::parse_iterative(xml, None)
-                .expect("iterative parser accepts an empty system identifier"),
-        ] {
-            assert_eq!(
-                document
-                    .unparsed_entities()
-                    .map(|(name, uri, _)| (name, uri))
-                    .collect::<Vec<_>>(),
-                vec![("logo", "")]
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_entity_declarations_retain_the_first_binding() {
-        // XML binds the first declaration of an entity; later declarations neither replace it
-        // nor make an otherwise well-formed document invalid.
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE r [<!ENTITY e "first"><!ENTITY e "second">]><r>&e;</r>"#,
-            None,
-        )
-        .expect("duplicate entity declarations are well-formed");
-        assert_eq!(document.string_value(document.root()), "first");
-    }
-
-    #[test]
-    fn rejected_unparsed_entity_registration_preserves_the_first_binding() {
-        // A failed public mutation must leave the accepted document metadata unchanged.
-        let mut document = Document::parse_iterative("<root/>", None).expect("document parses");
-        document
-            .register_unparsed_entity("logo", "memory:first")
-            .expect("first entity is accepted");
-        let error = document
-            .register_unparsed_entity("logo", "memory:rejected")
-            .expect_err("duplicate entity is rejected");
-        assert!(matches!(error, super::Error::Xml(message) if message.contains("duplicate")));
-        assert_eq!(
-            document
-                .unparsed_entities()
-                .map(|(name, uri, _)| (name, uri))
-                .collect::<Vec<_>>(),
-            vec![("logo", "memory:first")]
-        );
-    }
-
-    #[test]
-    fn internal_dtd_declaration_boundaries_are_enforced() {
-        // XML 1.0 productions [52] and [71] permit an empty ATTLIST but require S before each
-        // attribute definition and before NDATA.
-        // https://www.w3.org/TR/xml/#NT-AttlistDecl
-        // https://www.w3.org/TR/xml/#NT-GEDecl
-        Document::parse_iterative("<!DOCTYPE r [<!ATTLIST r>]><r/>", None)
-            .expect("an empty ATTLIST is well-formed");
-        for malformed in [
-            r#"<!DOCTYPE r [<!ATTLIST r a CDATA "x"b CDATA "y">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY logo SYSTEM "logo.png"NDATA png>]><r/>"#,
-        ] {
-            Document::parse_iterative(malformed, None)
-                .expect_err("missing DTD declaration whitespace must be rejected");
-        }
-    }
-
-    #[test]
-    fn every_attlist_default_validates_reference_grammar() {
-        // XML 1.0 production [10] applies while parsing the declaration, regardless of whether
-        // an explicit attribute later prevents the default from being used.
-        // https://www.w3.org/TR/xml/#NT-AttValue
-        for malformed in [
-            r#"<!DOCTYPE r [<!ATTLIST r a CDATA "&broken">]><r a="explicit"/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST unused a CDATA "&#x110000;">]><r/>"#,
-        ] {
-            Document::parse_iterative(malformed, None)
-                .expect_err("malformed unused ATTLIST defaults must be rejected");
-        }
-    }
-
-    #[test]
-    fn internal_dtd_enumerations_follow_xml_token_grammar() {
-        for valid in [
-            r#"<!DOCTYPE r [<!ATTLIST r mode (1 | a:b | x-y) "1">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r format NOTATION (png | jpeg) "png">]><r/>"#,
-        ] {
-            Document::parse_iterative(valid, None)
-                .expect("well-formed enumeration tokens must be accepted");
-        }
-
-        for malformed in [
-            r#"<!DOCTYPE r [<!ATTLIST r mode () "a">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r mode ( ) "a">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r mode (a||b) "a">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r mode (|a) "a">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r mode (a|) "a">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r mode (a b) "a">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r format NOTATION (png||jpeg) "png">]><r/>"#,
-            r#"<!DOCTYPE r [<!ATTLIST r format NOTATION (1png|jpeg) "jpeg">]><r/>"#,
-        ] {
-            Document::parse_iterative(malformed, None)
-                .expect_err("malformed enumeration grammar must be rejected");
-        }
-    }
-
-    #[test]
-    fn internal_dtd_markup_declarations_follow_xml_grammar() {
-        for valid in [
-            r#"<!DOCTYPE r [<!ELEMENT r (head, (body | note)*, tail?)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA | item)*>]><r/>"#,
-            r#"<!DOCTYPE r [<!NOTATION png SYSTEM "image/png">]><r/>"#,
-            r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png">]><r/>"#,
-            r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" "png.viewer">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY e "parameter &amp; &#37;">]><r>&e;</r>"#,
-        ] {
-            Document::parse_iterative(valid, None)
-                .expect("well-formed markup declaration must be accepted");
-        }
-
-        for malformed in [
-            r#"<!DOCTYPE r [<!ELEMENT r (a||b)>]><r/>"#,
-            // PE references within internal declarations violate XML 1.0 section 2.8.
-            r#"<!DOCTYPE r [<!ENTITY % p "parameter"><!ENTITY e "%p; &amp; &#37;">]><r>&e;</r>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (a,b|c)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA|item)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r EMPTY extra>]><r/>"#,
-            r#"<!DOCTYPE r [<!NOTATION png SYSTEM>]><r/>"#,
-            r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" extra>]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY e PUBLIC "[bad" "urn:example">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY e "%">]><r>&e;</r>"#,
-            r#"<!DOCTYPE r [<!ENTITY e "&bad">]><r>&e;</r>"#,
-            r#"<!DOCTYPE r [<!UNKNOWN r ANY>]><r/>"#,
-        ] {
-            Document::parse_iterative(malformed, None)
-                .expect_err("malformed markup declaration must be rejected");
-        }
-    }
-
-    #[test]
-    fn element_children_groups_follow_choice_and_sequence_grammar() {
-        for valid in [
-            r#"<!DOCTYPE r [<!ELEMENT r (a)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (a?)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r ((a,b))>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (a,b)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (a|b)>]><r/>"#,
-        ] {
-            Document::parse_iterative(valid, None)
-                .expect("single-particle sequences and multi-particle groups remain valid");
-        }
-
-        for malformed in [
-            r#"<!DOCTYPE r [<!ELEMENT r ()>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (|a)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (a|)>]><r/>"#,
-            r#"<!DOCTYPE r [<!ELEMENT r (a,)>]><r/>"#,
-        ] {
-            Document::parse_iterative(malformed, None)
-                .expect_err("incomplete choice and sequence groups must be rejected");
-        }
-    }
-
-    #[test]
-    fn parameter_attributes_and_duplicate_unparsed_entities_keep_xml_semantics() {
-        // Parameter entities can contribute declarations, while XML 1.0 section 4.2 binds the
-        // first general-entity declaration and ignores later duplicates.
-        // https://www.w3.org/TR/xml/#sec-entity-decl
-        let document = Document::parse_iterative(
-            r#"<!DOCTYPE r [
-              <!ENTITY % attrs '<!ATTLIST r status NMTOKENS "  ready   now  ">'>
-              %attrs;
-              <!NOTATION png SYSTEM "image/png">
-              <!ENTITY logo SYSTEM "first.png" NDATA png>
-              <!ENTITY logo SYSTEM "second.png" NDATA png>
-            ]><r/>"#,
-            Some("https://example.test/source.xml"),
-        )
-        .expect("parameter-provided attributes and duplicate entities parse");
-        let status = document.nodes().find_map(|(_, node)| match &node.kind {
-            super::NodeKind::Element { attributes, .. } => attributes
-                .iter()
-                .find(|attribute| attribute.name.local == "status")
-                .map(|attribute| attribute.value.as_str()),
-            _ => None,
-        });
-        assert_eq!(status, Some("ready now"));
-        assert_eq!(
-            document
-                .unparsed_entities()
-                .map(|(name, uri, _)| (name, uri))
-                .collect::<Vec<_>>(),
-            vec![("logo", "https://example.test/first.png")]
-        );
-    }
-
-    #[test]
-    fn predefined_entity_redeclarations_preserve_xml_builtins() {
-        // XML permits only the normative replacement forms for predefined entities. A malformed
-        // declaration must not replace a builtin before the document reaches the XML parser.
-        for invalid in [
-            r#"<!DOCTYPE r [<!ENTITY amp "evil">]><r>&amp;</r>"#,
-            r#"<!DOCTYPE r [<!ENTITY amp "&#38;">]><r>&amp;</r>"#,
-            r#"<!DOCTYPE r [<!ENTITY lt "&#60;">]><r>&lt;</r>"#,
-        ] {
-            assert!(Document::parse_iterative(invalid, None).is_err());
-        }
-
-        let valid = r#"<!DOCTYPE r [
-            <!ENTITY amp "&#38;#38;">
-            <!ENTITY apos "&#39;">
-            <!ENTITY gt "&#62;">
-            <!ENTITY lt "&#38;#60;">
-            <!ENTITY quot "&#34;">
-        ]><r>&amp;&lt;&gt;&apos;&quot;</r>"#;
-        let document = Document::parse_iterative(valid, None)
-            .expect("normative predefined-entity redeclarations remain well-formed");
-        assert_eq!(document.string_value(document.root()), "&<>'\"");
-    }
-
-    #[test]
-    fn predefined_amp_and_lt_require_double_escaped_declarations() {
-        // XML 1.0 requires the replacement text for amp and lt to remain a character reference
-        // after the declaration's first entity-replacement pass.
-        assert!(normalize_predefined_entity_declaration("amp", "&#38;".into()).is_err());
-        assert!(normalize_predefined_entity_declaration("lt", "&#60;".into()).is_err());
-        assert_eq!(
-            normalize_predefined_entity_declaration("amp", "&#38;#38;".into())
-                .expect("normative amp declaration"),
-            "&#38;"
-        );
-        assert_eq!(
-            normalize_predefined_entity_declaration("lt", "&#38;#60;".into())
-                .expect("normative lt declaration"),
-            "&#60;"
-        );
-    }
-
-    #[test]
-    fn internal_parameter_entities_contribute_markup_declarations() {
-        // Parameter entities in the internal subset can expand to declarations consumed by the
-        // document. The parser must process that declaration before resolving general entities.
-        let xml = r#"<!DOCTYPE r [<!ENTITY % defs '<!ENTITY e "ok">'> %defs;]><r>&e;</r>"#;
-        let mut references = 0;
-        let mut meter = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
-        let (prepared, declarations) = internal_general_entities(xml, &mut references, &mut meter)
-            .expect("parameter entity subset is prepared");
-        assert_eq!(prepared, r#"<!DOCTYPE r [ <!ENTITY e "ok">]><r>&e;</r>"#);
-        assert_eq!(
-            declarations.general.get("e").map(String::as_str),
-            Some("ok")
-        );
-
-        let document =
-            Document::parse_iterative(xml, None).expect("parameter entity declaration expands");
-        assert_eq!(document.string_value(document.root()), "ok");
-    }
-
-    #[test]
-    fn staged_parameter_entities_contribute_markup_declarations() {
-        // XML 1.0 sections 4.4.8 and 4.5 allow replacement text to contribute declarations;
-        // every newly exposed parameter declaration must therefore join the same bounded pass.
-        // https://www.w3.org/TR/xml/#included-in-literal
-        let xml = r#"<!DOCTYPE r [<!ENTITY % first '<!ENTITY &#37; second "<!ENTITY e &#39;ok&#39;>">'> %first; %second;]><r>&e;</r>"#;
-        let document = Document::parse_iterative(xml, None)
-            .expect("staged parameter entity declarations expand");
-        assert_eq!(document.string_value(document.root()), "ok");
-    }
-
-    #[test]
-    fn malformed_parameter_entity_declarations_are_not_stripped() {
-        // A declaration may be removed from the subset only after the complete PEDecl grammar
-        // has been recognized; otherwise preprocessing can hide malformed XML from the parser.
-        for malformed in [
-            r#"<!DOCTYPE r [<!ENTITY % p "x" BOGUS>]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY % p "x &broken">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY % p "x %broken">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY % p "&#0;">]><r/>"#,
-            r#"<!DOCTYPE r [<!ENTITY e "&#+65;">]><r>&e;</r>"#,
-            r#"<!DOCTYPE r [<!ENTITY e "&#X41;">]><r>&e;</r>"#,
-            "<!DOCTYPE r [<!ENTITY % p \"x\"\u{000b}>]><r/>",
-            "<!DOCTYPE r [<!ENTITY % p \"x\"\u{000c}>]><r/>",
-        ] {
-            assert!(Document::parse_iterative(malformed, None).is_err());
-        }
-
-        Document::parse_iterative("<!DOCTYPE r [<!ENTITY % p \"x\" \t\r\n>]><r/>", None)
-            .expect("XML S before the declaration terminator remains valid");
-    }
-
-    #[test]
-    fn undeclared_parameter_entity_references_are_rejected() {
-        // XML 1.0 section 4.1 requires every parameter-entity reference to name a declared
-        // entity; preprocessing must not leave an unknown reference for the DTD scanner to hide.
-        // https://www.w3.org/TR/xml/#wf-entdeclared
-        let error = Document::parse_iterative("<!DOCTYPE r [%missing;]><r/>", None)
-            .expect_err("an undeclared parameter entity is not well-formed XML");
-        assert!(
-            matches!(&error, Error::Xml(message) if message.contains("parameter entity")),
-            "unexpected rejection: {error:?}"
-        );
-        Document::parse_iterative(
-            "<!DOCTYPE r [<!ENTITY % declared '<!ELEMENT r EMPTY>'>%declared;]><r/>",
-            None,
-        )
-        .expect("a declared parameter entity remains valid");
-    }
-
-    #[test]
-    fn undeclared_entities_in_unused_attribute_defaults_are_rejected() {
-        // XML 1.0 section 4.1 applies the Entity Declared well-formedness constraint to entity
-        // references in every declared default, whether or not an element uses that attribute.
-        // https://www.w3.org/TR/xml/#wf-entdeclared
-        let error = Document::parse_iterative(
-            r#"<!DOCTYPE r [<!ATTLIST unused value CDATA "&missing;">]><r/>"#,
-            None,
-        )
-        .expect_err("an undeclared entity in an unused default is not well-formed XML");
-        assert!(
-            matches!(&error, Error::Xml(message) if message.contains("undeclared entity")),
-            "unexpected rejection: {error:?}"
-        );
-
-        Document::parse_iterative(
-            r#"<!DOCTYPE r [<!ENTITY declared "ok"><!ATTLIST unused value CDATA "&declared;">]><r/>"#,
-            None,
-        )
-            .expect("a forward-resolved default entity remains valid");
-    }
-
-    #[test]
-    fn external_entities_are_rejected_transitively_in_attribute_defaults() {
-        // XML 1.0 Fifth Edition section 3.1 forbids direct and indirect external entity
-        // references in attribute values, including defaults that are never applied.
-        // https://www.w3.org/TR/2008/REC-xml-20081126/#NoExternalRefs
-        let xml = r#"<!DOCTYPE r [<!ENTITY ext SYSTEM "external.txt"><!ENTITY middle "&ext;"><!ENTITY outer "&middle;"><!ATTLIST unused value CDATA "&outer;">]><r/>"#;
-        let error = Document::parse_iterative(xml, None)
-            .expect_err("attribute defaults must not reach parsed external entities indirectly");
-        assert!(
-            matches!(&error, Error::Xml(message) if message.contains("external entity")),
-            "unexpected rejection: {error:?}"
-        );
-    }
-
-    #[test]
-    fn external_subset_may_declare_unused_attribute_default_entities() {
-        // XML 1.0 Fifth Edition section 4.1 does not require a non-validating processor to read
-        // the external subset unless standalone="yes"; an undeclared reference may therefore be
-        // supplied externally: https://www.w3.org/TR/2008/REC-xml-20081126/#wf-entdeclared
-        Document::parse_iterative(
-            r#"<!DOCTYPE r SYSTEM "memory:external.dtd" [<!ATTLIST unused value CDATA "&external;">]><r/>"#,
-            None,
-        )
-        .expect("a non-standalone document may rely on an external entity declaration");
-
-        for xml in [
-            r#"<!DOCTYPE r [<!ATTLIST unused value CDATA "&external;">]><r/>"#,
-            r#"<?xml version="1.0" standalone="yes"?><!DOCTYPE r SYSTEM "memory:external.dtd" [<!ATTLIST unused value CDATA "&external;">]><r/>"#,
-        ] {
-            Document::parse_iterative(xml, None)
-                .expect_err("the entity declaration is required without the external exception");
-        }
-    }
-
-    #[test]
-    fn parameter_entity_expansion_enforces_recursive_aggregate_limits() {
-        // Parameter entities share the bounded expansion path used by document entities: cycles,
-        // aggregate references, and materialized bytes must all fail before parser allocation.
-        let recursive = HashMap::from([("loop".into(), "%loop;".into())]);
-        assert!(
-            expand_parameter_entity_references(
-                "%loop;",
-                &recursive,
-                &[],
-                0,
-                &mut 0,
-                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
-            )
-            .is_err()
-        );
-
-        let leaf = HashMap::from([("leaf".into(), "x".into())]);
-        let references = "%leaf;".repeat(256);
-        assert!(matches!(
-            expand_parameter_entity_references(
-                &references,
-                &leaf,
-                &[],
-                0,
-                &mut 0,
-                &mut EntityExpansionMeter::with_reference_limit(ENTITY_EXPANSION_BYTE_CEILING, 255,),
-            ),
-            Err(Error::Budget {
-                kind: BudgetKind::EntityReferences,
-                limit: 255,
-                actual: 256,
-            })
-        ));
-        assert!(
-            expand_parameter_entity_references(
-                "%leaf;",
-                &leaf,
-                &[],
-                0,
-                &mut 0,
-                &mut EntityExpansionMeter::new(0),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn attribute_normalization_preserves_referenced_whitespace() {
-        // Literal XML whitespace normalizes to spaces, while character references append their
-        // referenced scalar after normalization and therefore retain tab/newline characters.
-        let document = Document::parse_iterative("<r a=\"\t&#x9;&#xA;&#xD;\"/>", None)
-            .expect("attribute whitespace parses");
-        let value = document
-            .nodes()
-            .find_map(|(_, node)| match &node.kind {
-                super::NodeKind::Element { attributes, .. } => {
-                    attributes.first().map(|attribute| attribute.value.as_str())
-                }
-                _ => None,
-            })
-            .expect("attribute exists");
-        assert_eq!(value, " \t\n\r");
-    }
-
-    #[test]
-    fn entity_expansion_accepts_source_bounded_long_names() {
-        // XML 1.0 productions [4], [5], [68], and [69] impose no lexical byte ceiling on Name.
-        // https://www.w3.org/TR/xml/#NT-Name
-        let name = format!("entity{}", "a".repeat(1_025));
-        let source = format!("&{name};");
-        let entities = HashMap::from([(name.clone(), "expanded".into())]);
-        assert_eq!(
-            expand_entity_references(
-                &source,
-                &entities,
-                0,
-                &mut 0,
-                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
-            )
-            .expect("source-bounded entity scan succeeds"),
-            "expanded"
-        );
-
-        let parameter_source = format!("%{name};");
-        assert_eq!(
-            expand_parameter_entity_references(
-                &parameter_source,
-                &entities,
-                &[],
-                0,
-                &mut 0,
-                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
-            )
-            .expect("source-bounded parameter entity scan succeeds"),
-            "expanded"
-        );
-
-        let general_xml = format!("<!DOCTYPE r [<!ENTITY {name} 'expanded'>]><r>&{name};</r>");
-        let general = Document::parse_iterative(&general_xml, None)
-            .expect("a long general entity name remains valid XML");
-        assert_eq!(general.string_value(general.root()), "expanded");
-
-        let parameter_xml =
-            format!("<!DOCTYPE r [<!ENTITY % {name} ' '> %{name};]><r>expanded</r>");
-        let parameter = Document::parse_iterative(&parameter_xml, None)
-            .expect("a long parameter entity name remains valid XML");
-        assert_eq!(parameter.string_value(parameter.root()), "expanded");
-    }
-
-    #[test]
-    fn frontend_preserves_declared_attribute_normalization() {
-        // XML 1.0 section 3.3.3: tokenized values collapse spaces, while character
-        // references in CDATA defaults retain their referenced whitespace.
-        for (xml, expected) in [
-            (
-                r#"<!DOCTYPE r [<!ATTLIST r a NMTOKENS #IMPLIED>]><r a="  one   two  "/>"#,
-                "one two",
-            ),
-            (
-                r#"<!DOCTYPE r [<!ATTLIST r a CDATA "&#9;&#10;&#13;">]><r/>"#,
-                "\t\n\r",
-            ),
-        ] {
-            let prepared = super::prepare_xml_frontend_bounded(xml, 100_000, 64)
-                .expect("DTD preprocessing succeeds");
-            let document = roxmltree::Document::parse(&prepared).expect("prepared XML parses");
-            assert_eq!(document.root_element().attribute("a"), Some(expected));
-        }
-    }
-
-    #[test]
-    fn unused_entity_declarations_keep_the_source_borrowed() {
-        // Declaring an entity must not force a full document or attribute copy when no
-        // replacement is required on the parsed path.
-        let xml = "<!DOCTYPE root [<!ENTITY unused 'value'>]><root plain='text'/>";
-        let entities = HashMap::from([("unused".to_owned(), "value".to_owned())]);
-        let mut references = 0;
-        let mut meter = EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING);
-        assert!(matches!(
-            expand_document_entities(xml, &entities, &mut references, &mut meter)
-                .expect("unused declaration is accepted"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        assert!(matches!(
-            expand_entity_references("text", &entities, 0, &mut references, &mut meter,)
-                .expect("plain attribute is accepted"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-    }
-
-    #[test]
-    fn shallow_and_iterative_frontends_expand_explicit_attribute_entities_identically() {
-        // XML 1.0 section 3.3.3 requires general entity replacement while normalizing every
-        // explicit attribute value: https://www.w3.org/TR/xml/#AVNormalize
-        let xml =
-            r#"<!DOCTYPE root [<!ENTITY quoted '&quot;value&quot;'>]><root attr="&quoted;"/>"#;
-        let shallow = Document::parse(xml, None).expect("shallow frontend expands the entity");
-        let iterative =
-            Document::parse_iterative(xml, None).expect("iterative frontend expands the entity");
-        assert_eq!(shallow, iterative);
-        let root = shallow
-            .node(shallow.root())
-            .expect("document root exists")
-            .children[0];
-        let NodeKind::Element { attributes, .. } =
-            &shallow.node(root).expect("element exists").kind
-        else {
-            panic!("document child is an element");
-        };
-        assert_eq!(attributes[0].value, "\"value\"");
-
-        let prepared = prepare_xml_frontend_bounded(
-            xml,
-            ENTITY_EXPANSION_BYTE_CEILING,
-            ENTITY_EXPANSION_DEPTH_CEILING,
-        )
-        .expect("roxmltree frontend preparation expands the entity");
-        let parsed = roxmltree::Document::parse(&prepared).expect("prepared XML parses");
-        assert_eq!(parsed.root_element().attribute("attr"), Some("\"value\""));
-    }
-
-    #[test]
-    fn unterminated_entity_names_with_utf8_remain_borrowed() {
-        // Source-bounded scanning stops only at lexical delimiters and never slices through a
-        // multibyte scalar when an entity reference is unterminated.
-        let source = format!("&{}é", "a".repeat(1_022));
-        let entities = HashMap::from([("x".to_owned(), "expanded".to_owned())]);
-        assert_eq!(
-            expand_entity_references(
-                &source,
-                &entities,
-                0,
-                &mut 0,
-                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
-            )
-            .expect("bounded entity scan succeeds"),
-            source
-        );
-    }
-
-    #[test]
-    fn wide_string_value_traversal_preserves_document_order() {
-        // A wide element must not require a sibling-sized DFS frontier merely to find the text
-        // nodes that contribute its XPath string-value.
-        let mut document = Document::empty(None);
-        let root = document.push(
-            document.root(),
-            NodeKind::Element {
-                name: ExpandedName::new(None::<String>, "root"),
-                prefix: None,
-                attributes: Vec::new(),
-                namespaces: Arc::new(Vec::new()),
-            },
-            None,
-        );
-        for _ in 0..4_096 {
-            document.push(
-                root,
-                NodeKind::Element {
-                    name: ExpandedName::new(None::<String>, "empty"),
-                    prefix: None,
-                    attributes: Vec::new(),
-                    namespaces: Arc::new(Vec::new()),
-                },
+            Document::parse_with_budget(
+                &xml,
                 None,
-            );
+                ParseBudget::UNBOUNDED.with_owned_bytes(1 << 22),
+            )
+            .expect("the same valid declarations fit sufficient workspace");
         }
-        document.push(
-            root,
-            NodeKind::Text {
-                value: "tail".into(),
-                disable_output_escaping: false,
-            },
-            None,
+        assert!(
+            violations.is_empty(),
+            "declarations escaped workspace: {violations:?}"
         );
-
-        assert_eq!(document.string_value(root), "tail");
     }
 
     #[test]
-    fn bounded_parse_rejects_source_before_building_the_tree() {
-        // A caller-selected source limit is enforced before entity expansion or arena growth.
-        let error = Document::parse_with_budget(
-            "<root/>",
-            None,
-            ParseBudget::new(
-                6,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-                usize::MAX,
-            ),
-        )
-        .expect_err("oversized source must be rejected");
-        assert!(matches!(
-            error,
-            Error::Budget {
-                kind: BudgetKind::SourceBytes,
-                limit: 6,
-                actual: 7,
-            }
-        ));
+    fn initial_root_storage_is_admitted_before_construction() {
+        // The initial arena and copied base URI are allocations too, even if
+        // the first opening tag would subsequently refuse the tiny workspace.
+        let long_base = format!("https://example.test/{}", "x".repeat(8192));
+        for (base, limit) in [(None, 0), (Some(long_base.as_str()), 4096)] {
+            CREATED_ROOTS.with(|count| count.set(0));
+            assert!(matches!(
+                Document::parse_with_budget(
+                    "<r/>",
+                    base,
+                    ParseBudget::UNBOUNDED.with_owned_bytes(limit)
+                ),
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                })
+            ));
+            CREATED_ROOTS.with(|count| assert_eq!(count.get(), 0));
+        }
     }
 
     #[test]
-    fn parser_workspace_bound_covers_wide_retained_documents() {
-        // External-resource parsing reserves this bound before scanning. A wide start tag is the
-        // adversarial shape where attribute-vector and semantic-arena storage dominate input size.
-        let attributes = (0..4096)
-            .map(|index| format!(" a{index}='x'"))
-            .collect::<String>();
+    fn scalar_text_is_admitted_before_normalization() {
+        // Text, CDATA, comments and PI content share the same normalization
+        // allocation; none may materialize a large value before workspace admission.
+        let large = "x".repeat(64 * 1024);
+        let mut materialized = Vec::new();
+        for xml in [
+            format!("<r>{large}</r>"),
+            format!("<r><![CDATA[{large}]]></r>"),
+            format!("<r><!--{large}--></r>"),
+            format!("<r><?p {large}?></r>"),
+        ] {
+            NORMALIZED_BYTES.with(|bytes| bytes.set(0));
+            let result = Document::parse_with_budget(
+                &xml,
+                None,
+                ParseBudget::UNBOUNDED.with_owned_bytes(4096),
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                })
+            ));
+            materialized.push(NORMALIZED_BYTES.with(std::cell::Cell::get));
+        }
+        assert_eq!(materialized, [0; 4], "normalization ran before admission");
+    }
+
+    #[test]
+    fn discarded_misc_whitespace_needs_no_owned_copy() {
+        // XPath's root node has no whitespace text children; ignored XML Misc
+        // must not allocate a document-sized normalization buffer.
+        let xml = format!("{}<r/>{}", " \r\n".repeat(8192), " \r\n".repeat(8192));
+        NORMALIZED_BYTES.with(|bytes| bytes.set(0));
+        Document::parse_with_budget(&xml, None, ParseBudget::UNBOUNDED.with_owned_bytes(4096))
+            .expect("tiny tree fits despite ignored whitespace");
+        NORMALIZED_BYTES.with(|bytes| assert_eq!(bytes.get(), 0));
+    }
+
+    #[test]
+    fn live_element_stack_capacity_remains_charged() {
+        // The identical projected element needs more live storage when its
+        // closing tag is still pending. Semantic staging must not refund frames.
+        let xml = "<root>";
+        let mut scanner = Scanner::new(xml);
+        let Some(Event::Start(start)) = scanner.next_event().expect("opening tag") else {
+            panic!("expected start element");
+        };
+        let measure = |empty| {
+            let mut document = Document::empty(None);
+            let mut elements = vec![StreamElementFrame {
+                node: document.root(),
+                lexical_name: None,
+            }];
+            let budget = ParseBudget::UNBOUNDED;
+            let mut meter = StreamParseMeter {
+                budget,
+                nodes: 1,
+                entity_references: 0,
+                entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
+                namespace_scope_bytes: 0,
+                owned_bytes: elements.capacity() * std::mem::size_of::<StreamElementFrame>(),
+            };
+            push_stream_element(
+                &mut document,
+                &mut elements,
+                &start,
+                empty,
+                &InternalEntityDeclarations::default(),
+                &mut meter,
+            )
+            .expect("element fits unbounded workspace");
+            (meter.retained_bytes(), elements.capacity())
+        };
+        let (closed_bytes, closed_capacity) = measure(true);
+        let (open_bytes, open_capacity) = measure(false);
+        assert!(
+            open_capacity > closed_capacity,
+            "test exercises frame growth"
+        );
+        assert!(
+            open_bytes
+                >= closed_bytes
+                    + (open_capacity - closed_capacity) * std::mem::size_of::<StreamElementFrame>(),
+            "live frame capacity was refunded with semantic staging"
+        );
+    }
+
+    #[test]
+    fn lexical_attributes_cannot_materialize_before_workspace_admission() {
+        // The lexical event itself owns a vector; refusing semantic staging
+        // afterwards cannot pay for that already-materialized opening tag.
+        let attributes = (0..128).map(|i| format!(" a{i}='v'")).collect::<String>();
         let xml = format!("<root{attributes}/>");
-        let document = Document::parse(&xml, None).expect("wide document parses");
-        assert!(parser_workspace_bytes(&xml) >= document.estimated_owned_bytes());
-    }
-
-    #[test]
-    fn owned_estimate_counts_retained_capacity_past_logical_lengths() {
-        // External-document accounting must retain the actual backing stores after parsing, even
-        // when allocator growth leaves most of a container unused.
-        let mut document = Document::empty(None);
-        document.nodes.reserve_exact(16);
-        document.logical_roots.reserve_exact(8);
-        document.nodes[0].children.reserve_exact(4);
-
-        let clone_bytes = document.estimated_clone_bytes();
-        assert!(document.estimated_owned_bytes() > clone_bytes);
-    }
-
-    #[test]
-    fn namespace_index_preserves_order_while_overriding_bindings() {
-        // QName lookup needs constant-time prefix selection without changing namespace-node order.
-        let mut namespaces = Arc::new(vec![
-            Namespace {
-                prefix: Some("a".into()),
-                uri: "urn:old".into(),
-            },
-            Namespace {
-                prefix: None,
-                uri: "urn:default".into(),
-            },
-        ]);
-        let mut index = namespace_index(&namespaces);
-        set_namespace(
-            &mut namespaces,
-            &mut index,
-            Some("a".into()),
-            "urn:new".into(),
-        );
-        set_namespace(
-            &mut namespaces,
-            &mut index,
-            Some("b".into()),
-            "urn:added".into(),
-        );
-
-        assert_eq!(
-            namespaces
-                .iter()
-                .map(|namespace| (namespace.prefix.as_deref(), namespace.uri.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (Some("a"), "urn:new"),
-                (None, "urn:default"),
-                (Some("b"), "urn:added"),
-            ]
-        );
-        assert_eq!(
-            namespace_for(&namespaces, &index, Some("a")).as_deref(),
-            Some("urn:new")
-        );
-    }
-
-    #[test]
-    fn bounded_parse_rejects_node_and_depth_growth() {
-        // The synthetic root counts as one node; each XML element must reserve its slot before
-        // materializing attributes, namespace state, or arena storage.
+        SCANNED_ATTRIBUTES.with(|count| count.set(0));
+        let result =
+            Document::parse_with_budget(&xml, None, ParseBudget::UNBOUNDED.with_owned_bytes(128));
         assert!(matches!(
-            Document::parse_with_budget(
-                "<root><child/></root>",
-                None,
-                ParseBudget::new(
-                    usize::MAX,
-                    2,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                ),
-            ),
+            result,
             Err(Error::Budget {
-                kind: BudgetKind::SourceNodes,
-                limit: 2,
-                actual: 3,
+                kind: BudgetKind::OwnedBytes,
+                ..
             })
         ));
-        assert!(matches!(
-            Document::parse_with_budget(
-                "<root><child/></root>",
-                None,
-                ParseBudget::new(
-                    usize::MAX,
-                    usize::MAX,
-                    1,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                ),
-            ),
-            Err(Error::Budget {
-                kind: BudgetKind::RecursionDepth,
-                limit: 1,
-                actual: 2,
-            })
-        ));
+        SCANNED_ATTRIBUTES.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "opening-tag vector was materialized before the workspace refusal"
+            )
+        });
     }
 
     #[test]
-    fn bounded_byte_parse_limits_decoded_output() {
-        // UTF-16 input can expand after decoding; the decoded source budget remains authoritative.
-        let mut bytes = vec![0xff, 0xfe];
-        for unit in "<r>é</r>".encode_utf16() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
+    fn attribute_staging_is_admitted_before_semantic_processing() {
+        // Ordinary and DTD-defaulted attributes must not reach QName resolution
+        // after constructing attacker-sized staging buffers without workspace.
+        for defaults in [false, true] {
+            let attributes = (0..64)
+                .map(|i| {
+                    if defaults {
+                        format!("a{i} CDATA 'value' ")
+                    } else {
+                        format!("a{i}='value' ")
+                    }
+                })
+                .collect::<String>();
+            let xml = if defaults {
+                format!(
+                    "<!DOCTYPE root [<!ATTLIST root {attributes} missing:last CDATA 'v'>]><root/>"
+                )
+            } else {
+                format!("<root {attributes} missing:last='v'/>")
+            };
+            let mut references = 0;
+            let mut expansion = EntityExpansionMeter::new(1 << 20);
+            let (_, declarations) =
+                internal_general_entities(&xml, &mut references, &mut expansion)
+                    .expect("declarations parse");
+            let mut scanner = Scanner::new(&xml);
+            let start = loop {
+                match scanner
+                    .next_event()
+                    .expect("lexical event")
+                    .expect("root start")
+                {
+                    Event::Empty(start) => break start,
+                    _ => continue,
+                }
+            };
+            let mut document = Document::empty(None);
+            let mut elements = vec![StreamElementFrame {
+                node: document.root(),
+                lexical_name: None,
+            }];
+            let budget = ParseBudget::UNBOUNDED.with_owned_bytes(1024);
+            let mut meter = StreamParseMeter {
+                budget,
+                nodes: 1,
+                entity_references: 0,
+                entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
+                namespace_scope_bytes: 0,
+                owned_bytes: 0,
+            };
+            let result = push_stream_element(
+                &mut document,
+                &mut elements,
+                &start,
+                true,
+                &declarations,
+                &mut meter,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Budget {
+                        kind: BudgetKind::OwnedBytes,
+                        ..
+                    })
+                ),
+                "defaults={defaults}: {result:?}"
+            );
         }
+    }
+
+    #[test]
+    fn parser_work_stops_entity_materialization_before_append() {
+        // A later scan refusal cannot pay for strings already materialized.
+        let xml = format!(
+            "<!DOCTYPE doc [<!ENTITY e '{}'>]><doc>{}</doc>",
+            "x".repeat(2000),
+            "&e;".repeat(100)
+        );
+        APPENDED.with(|bytes| bytes.set(0));
+        let report = Document::parse_with_budget_reported(
+            &xml,
+            None,
+            ParseBudget::new(1 << 20, 100, 32, 1000, 1 << 20, 1 << 20)
+                .with_owned_bytes(1 << 20)
+                .with_parse_work_bytes(25_000),
+        );
         assert!(matches!(
-            Document::parse_bytes_with_budget(
-                &bytes,
-                None,
-                ParseBudget::new(
-                    8,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                ),
-            ),
+            report.outcome,
             Err(Error::Budget {
-                kind: BudgetKind::SourceBytes,
-                limit: 8,
-                actual,
-            }) if actual > 8
+                kind: BudgetKind::ParseWorkBytes,
+                ..
+            })
+        ));
+        APPENDED.with(|bytes| {
+            assert!(
+                bytes.get() <= 25_000,
+                "{} bytes appended before work admission",
+                bytes.get()
+            )
+        });
+    }
+
+    #[test]
+    fn entity_expansion_cannot_outgrow_parser_workspace() {
+        // Expansion is temporary parser storage, not merely a limit on the
+        // tree eventually retained after a much larger string was allocated.
+        let budget = ParseBudget::new(4096, 100, 32, 100, 4096, 4096).with_owned_bytes(128);
+        let mut meter = EntityExpansionMeter::with_parse_budget(budget);
+        assert!(matches!(
+            meter.charge(129),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
         ));
     }
 }

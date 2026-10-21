@@ -35,7 +35,10 @@ pub(crate) enum ReferenceInput<'a> {
         root: Node<'a, 'a>,
         with_comments: bool,
     },
-    Binary(&'a [u8]),
+    Binary {
+        bytes: &'a [u8],
+        uri: &'a str,
+    },
 }
 
 pub(crate) enum NormalizedFragment<'uri, B> {
@@ -507,6 +510,20 @@ impl<'a> UriReferenceResolver<'a> {
         Ok(Some(bytes))
     }
 
+    fn external_resource_input(
+        &self,
+        uri: &str,
+    ) -> Result<Option<ReferenceInput<'a>>, TransformError> {
+        let Some((uri, bytes)) = self
+            .external_resources
+            .and_then(|resources| resources.get_key_value(uri))
+        else {
+            return Ok(None);
+        };
+        self.external_resource_budget.charge(bytes.len())?;
+        Ok(Some(ReferenceInput::Binary { bytes, uri }))
+    }
+
     pub(crate) fn external_resource_identity(
         &self,
         uri: &str,
@@ -550,7 +567,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// | `"#foo"` | Subtree rooted at element with ID `foo`, comments excluded |
     /// | `"#xpointer(/)"` | Entire document, comments included |
     /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo`, comments included |
-    /// | external URI in caller map | A copy of the mapped bytes |
+    /// | external URI in caller map | `TransformData::Resource` borrowing the mapped bytes and their resolved map key |
     /// | other | `Err(UnsupportedUri)` |
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, None)
@@ -623,8 +640,7 @@ impl<'a> UriReferenceResolver<'a> {
         scratch
             .charge(resolved.len())
             .map_err(map_xml_base_execution_error)?;
-        self.external_resource(resolved)
-            .map(|bytes| bytes.map(ReferenceInput::Binary))
+        self.external_resource_input(resolved)
     }
 
     fn dereference_with_optional_budget(
@@ -649,8 +665,11 @@ impl<'a> UriReferenceResolver<'a> {
         } else if let Some(fragment) = uri.strip_prefix('#') {
             self.dereference_fragment(fragment, budget)
         } else {
-            self.external_resource(uri)?
-                .map(|bytes| TransformData::Binary(bytes.to_vec()))
+            self.external_resource_input(uri)?
+                .map(|input| match input {
+                    ReferenceInput::Binary { bytes, uri } => TransformData::Resource { bytes, uri },
+                    ReferenceInput::Xml { .. } => unreachable!("external resources are octets"),
+                })
                 .ok_or_else(|| TransformError::UnsupportedUri(uri.to_string()))
         }
     }

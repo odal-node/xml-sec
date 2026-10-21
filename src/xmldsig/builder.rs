@@ -510,6 +510,10 @@ impl SignatureBuilder {
             }
             .into());
         }
+        // Stylesheets are copied into the template verbatim; their sum is bounded by the
+        // document limit before any of them is written.
+        #[cfg(feature = "xslt")]
+        let mut stylesheet_bytes = 0usize;
         for reference in &self.references {
             validate_signing_reference_uri(&reference.uri, policy)?;
             // Bound newly introduced owned parameters before cloning the chain
@@ -524,6 +528,25 @@ impl SignatureBuilder {
                             }
                             other => SignatureBuilderError::InvalidTransform(other.to_string()),
                         })?;
+                }
+                #[cfg(feature = "xslt")]
+                if let Transform::Xslt(stylesheet) = transform {
+                    // Validate the target policy before cloning the transform
+                    // chain, not merely before writing the generated template.
+                    let actual = stylesheet.markup_len();
+                    if actual > policy.resources.max_xslt_workspace_bytes {
+                        return Err(PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XSLT_WORKSPACE_BYTES,
+                            maximum: policy.resources.max_xslt_workspace_bytes,
+                            actual,
+                        }
+                        .into());
+                    }
+                    // Check aggregate stylesheet markup before copying it.
+                    stylesheet_bytes = stylesheet_bytes.saturating_add(actual);
+                    policy
+                        .resources
+                        .validate_xml_document_len(stylesheet_bytes)?;
                 }
             }
             let generated_transforms = reference_transforms_for_generation(reference);
@@ -771,6 +794,15 @@ fn write_transform<W: Write>(
                     ],
                 )?;
             }
+            writer.end(&name)
+        }
+        #[cfg(feature = "xslt")]
+        Transform::Xslt(stylesheet) => {
+            let name = qualified_name(prefix, "Transform");
+            writer.start(&name, [("Algorithm", super::XSLT_TRANSFORM_URI)])?;
+            // Valid element content that depends on nothing outside it: a stylesheet
+            // parsed from another document is written with what it inherited there.
+            writer.raw(&stylesheet.markup())?;
             writer.end(&name)
         }
         Transform::Enveloped => {

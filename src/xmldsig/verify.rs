@@ -7,7 +7,8 @@
 //! This module wires together:
 //! - [`UriReferenceResolver`] for URI dereference
 //! - [`super::transforms::execute_transforms`] for the transform pipeline
-//! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
+//! - [`compute_digest`](super::digest::compute_digest) + [`constant_time_eq`] for digest
+//!   computation and comparison
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
 use crate::xml::dom::{Node, NodeId};
@@ -49,7 +50,7 @@ use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
     XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
-    map_c14n_resource_policy_violation, transform_chain_produces_binary,
+    map_c14n_resource_policy_violation, transform_chain_uses_implicit_c14n,
 };
 use super::types::{NodeSet, TransformError, subtree_node_id_range};
 use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
@@ -600,6 +601,7 @@ impl<'a> VerifyContext<'a> {
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
             .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
     }
 
     /// Verify one XMLDSig signature using this context.
@@ -1129,6 +1131,7 @@ impl<'a> VerificationOperationBudgets<'a> {
             &key_info_parse.certificates,
             utc_facts,
         );
+        let xpath_parse = XPathSignatureParseBudget::for_execution(&policy.resources, &transforms);
         Self {
             key_info_parse: RefCell::new(key_info_parse),
             key_candidates: RefCell::new(key_candidates),
@@ -1137,7 +1140,7 @@ impl<'a> VerificationOperationBudgets<'a> {
             canonicalized: CanonicalizedDataBudget::with_limit(
                 policy.resources.effective_canonicalized_bytes(),
             ),
-            xpath_parse: RefCell::new(XPathSignatureParseBudget::from_resources(&policy.resources)),
+            xpath_parse: RefCell::new(xpath_parse),
             key_info_materialization: RefCell::new(KeyInfoMaterializationState::default()),
             external_resource_identities: RefCell::new(HashMap::new()),
             resolved_reference_resources: RefCell::new(HashMap::new()),
@@ -3990,8 +3993,8 @@ fn inspect_signature_key_info_for_policy<P: KeyInfoReferencePolicy>(
         policy.resources().max_external_resource_bytes,
         policy.resources().max_external_resource_total_bytes,
     );
-    let mut xpath_parse = XPathSignatureParseBudget::from_resources(policy.resources());
     let execution = TransformExecutionBudget::from_resources(policy.resources());
+    let mut xpath_parse = XPathSignatureParseBudget::for_execution(policy.resources(), &execution);
     inspect_signature_key_info_with_budgets(
         node,
         &resolver,
@@ -4065,7 +4068,7 @@ pub fn inspect_pinned_verification_key_info(
     )? {
         return Ok(None);
     }
-    let mut xpath_parse = XPathSignatureParseBudget::from_resources(&policy.resources);
+    let mut xpath_parse = XPathSignatureParseBudget::for_execution(&policy.resources, &execution);
     inspect_signature_key_info_with_budgets(
         node,
         &resolver,
@@ -4096,8 +4099,9 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         policy.resources().max_external_resource_bytes,
         policy.resources().max_external_resource_total_bytes,
     );
-    let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(policy.resources());
     let execution_budget = TransformExecutionBudget::from_resources(policy.resources());
+    let mut xpath_parse_budget =
+        XPathSignatureParseBudget::for_execution(policy.resources(), &execution_budget);
     let mut budgets = RetrievalMaterializationBudgets {
         key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(policy.resources())),
         xpath_parse: &mut xpath_parse_budget,
@@ -4930,6 +4934,8 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
         | Transform::XPathFilter2(_)
         | Transform::Base64Decode
         | Transform::Relationship(_) => false,
+        #[cfg(feature = "xslt")]
+        Transform::Xslt(_) => false,
     }
 }
 
@@ -5052,11 +5058,10 @@ fn enforce_reference_policies(
             // whether the caller supplied the resource. Every transform then
             // determines the next type, including implicit binary-to-node-set
             // adapters before XML-level transforms.
-            let produces_binary = transform_chain_produces_binary(
+            if transform_chain_uses_implicit_c14n(
                 classify_uri(uri) == UriClass::External,
                 &reference.transforms,
-            );
-            if !produces_binary {
+            ) {
                 enforce_transform_allowed(Some(allowed), DEFAULT_IMPLICIT_C14N_URI)?;
             }
         }

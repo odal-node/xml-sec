@@ -144,6 +144,12 @@ impl<'context: 'doc, 'doc> BoundCipherReferenceContext<'context, 'doc> {
 }
 
 impl<'a> CipherReferenceContext<'a> {
+    pub(super) fn transform_parse_budget(&self) -> XPathSignatureParseBudget {
+        // Descriptor capture and execution share the operation's XSLT allowance,
+        // including key retrieval that recursively parses another resource.
+        XPathSignatureParseBudget::for_execution(&self.policy.resources, &self.transforms)
+    }
+
     pub(super) fn preflight_cipher_data(
         &self,
         cipher: &super::CipherData,
@@ -277,6 +283,9 @@ impl<'a> CipherReferenceContext<'a> {
         id_attributes: &'a [crate::IdAttributeRegistration],
     ) -> Result<Self, XmlEncError> {
         policy.validate()?;
+        let transforms =
+            TransformExecutionBudget::from_resources(&policy.resources).with_xml_backend(backend);
+        let parse = XPathSignatureParseBudget::for_execution(&policy.resources, &transforms);
         Ok(Self {
             policy,
             external: ExternalResourceContext::new(
@@ -284,11 +293,8 @@ impl<'a> CipherReferenceContext<'a> {
                 policy.resources.max_external_resource_bytes,
                 policy.resources.max_external_resource_total_bytes,
             ),
-            transforms: TransformExecutionBudget::from_resources(&policy.resources)
-                .with_xml_backend(backend),
-            parse: std::cell::RefCell::new(XPathSignatureParseBudget::from_resources(
-                &policy.resources,
-            )),
+            transforms,
+            parse: std::cell::RefCell::new(parse),
             id_attributes,
             backend,
             operation: None,
@@ -409,7 +415,7 @@ impl<'a> CipherReferenceContext<'a> {
         };
         let mut action = || {
             let input = match external {
-                Some(bytes) => crate::xmldsig::TransformData::Binary(bytes.to_vec()),
+                Some(bytes) => crate::xmldsig::TransformData::Resource { bytes, uri },
                 None => resolver
                     .dereference_with_budget(uri, self.transforms.node_set_materialization())?,
             };
@@ -428,6 +434,7 @@ impl<'a> CipherReferenceContext<'a> {
                     .id_attributes(resolver.id_registrations())
                     .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
                     .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+                    .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
                     .allow_internal_dtd(self.policy.xml.allow_internal_dtd),
                 &self.transforms,
                 xml_parse,

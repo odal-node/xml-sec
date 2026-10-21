@@ -35,6 +35,14 @@ pub enum TransformData<'a> {
     Binary(Vec<u8>),
     /// Original caller-supplied bytes, borrowed for a scoped transform chain.
     BorrowedBinary(&'a [u8]),
+    /// Caller-owned detached bytes and their resolved document-entity URI.
+    /// XSLT uses the borrowed URI as the input document-entity base URI.
+    Resource {
+        /// Original bytes supplied by the caller's external-resource map.
+        bytes: &'a [u8],
+        /// Resolved RFC 3986 identity of that map entry, not a filesystem path.
+        uri: &'a str,
+    },
 }
 
 impl std::fmt::Debug for TransformData<'_> {
@@ -43,6 +51,11 @@ impl std::fmt::Debug for TransformData<'_> {
             Self::NodeSet(_) => f.debug_tuple("NodeSet").field(&"...").finish(),
             Self::Binary(b) => f.debug_tuple("Binary").field(&b.len()).finish(),
             Self::BorrowedBinary(b) => f.debug_tuple("BorrowedBinary").field(&b.len()).finish(),
+            Self::Resource { bytes, uri } => f
+                .debug_struct("Resource")
+                .field("bytes", &bytes.len())
+                .field("uri", uri)
+                .finish(),
         }
     }
 }
@@ -52,10 +65,12 @@ impl<'a> TransformData<'a> {
     pub fn into_node_set(self) -> Result<NodeSet<'a>, TransformError> {
         match self {
             Self::NodeSet(ns) => Ok(ns),
-            Self::Binary(_) | Self::BorrowedBinary(_) => Err(TransformError::TypeMismatch {
-                expected: "NodeSet",
-                got: "Binary",
-            }),
+            Self::Binary(_) | Self::BorrowedBinary(_) | Self::Resource { .. } => {
+                Err(TransformError::TypeMismatch {
+                    expected: "NodeSet",
+                    got: "Binary",
+                })
+            }
         }
     }
 
@@ -64,6 +79,7 @@ impl<'a> TransformData<'a> {
         match self {
             Self::Binary(b) => Ok(b),
             Self::BorrowedBinary(b) => Ok(b.to_vec()),
+            Self::Resource { bytes, .. } => Ok(bytes.to_vec()),
             Self::NodeSet(_) => Err(TransformError::TypeMismatch {
                 expected: "Binary",
                 got: "NodeSet",
@@ -449,6 +465,16 @@ pub enum TransformError {
     /// OPC relationship parameters, MCE, or part structure are invalid.
     #[error("OPC relationship transform error: {0}")]
     Relationship(&'static str),
+
+    /// The XSLT stylesheet, its input document, or its execution failed.
+    #[cfg(feature = "xslt")]
+    #[error("XSLT transform error: {0}")]
+    Xslt(String),
+
+    /// XSLT diagnostic whose capacity remains charged to its current query.
+    #[cfg(feature = "xslt")]
+    #[error("XSLT transform error: {0}")]
+    AccountedXslt(structured_asn1::memory::OwnedText),
 
     /// XML octets could not be parsed while adapting binary transform output
     /// to the node-set required by a subsequent transform.
